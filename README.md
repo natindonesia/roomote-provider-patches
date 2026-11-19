@@ -4,8 +4,7 @@ Out-of-tree integrations that add **Lizard** and **Fly.io Sprites** as Roomote
 compute providers, shipped as a patch series so upstream can be tracked without
 maintaining a fork.
 
-The repo name still says "sprites" from the first cut. Rename with
-`gh repo rename roomote-provider-patches` if you want it to match.
+Lizard is the primary provider; Sprites is a client-only second entry.
 
 ## Status
 
