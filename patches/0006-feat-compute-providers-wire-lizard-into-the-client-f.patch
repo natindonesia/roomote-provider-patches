@@ -1,0 +1,96 @@
+From c3fd3281c9545d7cd35334eb3f1ba9b3c56184fa Mon Sep 17 00:00:00 2001
+From: Ticlext-Altihaf <hi@ticlext.top>
+Date: Thu, 19 Nov 2026 03:28:06 +0100
+Subject: [PATCH 6/6] feat(compute-providers): wire lizard into the client
+ factory
+
+Reads LIZARD_API_KEY and LIZARD_PROJECT plus optional LIZARD_API_URL,
+LIZARD_TEMPLATE, LIZARD_TIMEOUT_MS and LIZARD_SIZE.
+---
+ packages/compute-providers/src/factory.ts | 52 +++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+diff --git a/packages/compute-providers/src/factory.ts b/packages/compute-providers/src/factory.ts
+index 70fd5a7..6fa1881 100644
+--- a/packages/compute-providers/src/factory.ts
++++ b/packages/compute-providers/src/factory.ts
+@@ -17,6 +17,7 @@ import type {
+   E2bConfig,
+   ModalConfig,
+   SpritesConfig,
++  LizardConfig,
+ } from './types';
+ import { assertDefined } from './errors';
+ import {
+@@ -28,6 +29,7 @@ import {
+   BlaxelClient,
+   BoxClient,
+   SpritesClient,
++  LizardClient,
+   AzureClient,
+ } from './adapters';
+ 
+@@ -414,6 +416,33 @@ export function createComputeProviderClient(
+       return new SpritesClient(config);
+     }
+ 
++    case 'lizard': {
++      const apiKey = options.config?.apiKey ?? envValue('LIZARD_API_KEY');
++      const project = options.config?.project ?? envValue('LIZARD_PROJECT');
++      const apiUrl = options.config?.apiUrl ?? envValue('LIZARD_API_URL');
++      const template = options.config?.template ?? envValue('LIZARD_TEMPLATE');
++      const timeoutMs = parsePositiveNumber(envValue('LIZARD_TIMEOUT_MS'));
++      const size = parseLizardSize(envValue('LIZARD_SIZE'));
++
++      assertDefined(apiKey, 'Missing LIZARD_API_KEY');
++      assertDefined(project, 'Missing LIZARD_PROJECT');
++
++      const config: LizardConfig = {
++        ...(options.config ?? {}),
++        apiKey,
++        project,
++        ...(options.config?.apiUrl === undefined && apiUrl ? { apiUrl } : {}),
++        ...(options.config?.template === undefined && template
++          ? { template }
++          : {}),
++        ...(options.config?.timeoutMs === undefined && timeoutMs !== undefined
++          ? { timeoutMs }
++          : {}),
++        ...(options.config?.size === undefined && size ? { size } : {}),
++      };
++      return new LizardClient(config);
++    }
++
+     case 'azure': {
+       const subscriptionId =
+         options.config?.subscriptionId ?? envValue('AZURE_SUBSCRIPTION_ID');
+@@ -527,6 +556,29 @@ function parseBoxMachineType(
+   throw new Error('BOX_MACHINE_TYPE must be one of: small, default, large');
+ }
+ 
++function parseLizardSize(
++  value: string | undefined,
++): LizardConfig['size'] {
++  if (value === undefined) {
++    return undefined;
++  }
++
++  if (
++    value === 'nano' ||
++    value === 'mini' ||
++    value === 'small' ||
++    value === 'medium' ||
++    value === 'large' ||
++    value === 'big'
++  ) {
++    return value;
++  }
++
++  throw new Error(
++    'LIZARD_SIZE must be one of nano, mini, small, medium, large, big',
++  );
++}
++
+ function parseSpritesSize(value: string | undefined): SpritesConfig['size'] {
+   if (value === undefined) return undefined;
+   if (value === 'small' || value === 'default' || value === 'large') {

@@ -1,0 +1,39 @@
+name: verify
+
+# The integration is only as good as its ability to replay onto upstream.
+# This job proves the series still applies to current Roomote develop.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1" # Mondays, 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  applies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone upstream Roomote
+        run: |
+          git clone --depth 1 --branch develop \
+            https://github.com/RooCodeInc/Roomote.git upstream
+
+      - name: Apply patch series
+        working-directory: upstream
+        run: |
+          git config user.name  "ci"
+          git config user.email "ci@example.invalid"
+          git checkout -b verify
+          git am --3way "$GITHUB_WORKSPACE"/patches/*.patch
+          echo "--- applied ---"
+          git diff --stat develop..HEAD
+
+      - name: Report drift
+        if: failure()
+        run: |
+          echo "::error::Patch series no longer applies to upstream develop."
+          echo "Run './sync.sh' locally, resolve, and regenerate the series:"
+          echo "  git format-patch origin/develop..HEAD -o patches --no-signature"

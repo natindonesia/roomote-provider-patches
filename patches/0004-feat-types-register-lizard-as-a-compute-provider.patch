@@ -1,0 +1,184 @@
+From 6a1d07969f72c81147d4fad04a5df81f5ccf53dd Mon Sep 17 00:00:00 2001
+From: Ticlext-Altihaf <hi@ticlext.top>
+Date: Thu, 19 Nov 2026 03:28:06 +0100
+Subject: [PATCH 4/6] feat(types): register lizard as a compute provider
+
+Lizard is the only provider of the set that satisfies the full Roomote
+contract: native exit codes, per-port preview URLs, filesystem snapshots
+restored into the same project, and pause/resume standby. It is therefore
+listed in both the snapshot-capable and standby-capable sets.
+---
+ packages/compute-providers/src/types.ts       | 26 +++++++++++++++++++
+ .../src/compute-providers/capabilities.ts     | 26 +++++++++++++++++++
+ .../src/compute-providers/compute-provider.ts | 14 ++++++++++
+ .../src/compute-providers/worker-context.ts   |  2 ++
+ 4 files changed, 68 insertions(+)
+
+diff --git a/packages/compute-providers/src/types.ts b/packages/compute-providers/src/types.ts
+index f72061a..d34c15e 100644
+--- a/packages/compute-providers/src/types.ts
++++ b/packages/compute-providers/src/types.ts
+@@ -473,6 +473,28 @@ export interface SpritesConfig {
+   fetchImpl?: typeof fetch;
+ }
+ 
++export interface LizardConfig {
++  /** Lizard API key (`LIZARD_API_KEY`). */
++  apiKey: string;
++  /**
++   * Project every sandbox is attributed to — an id, slug, or name
++   * (`LIZARD_PROJECT`). Required: Lizard bills sandboxes to a project.
++   */
++  project: string;
++  /** Lizard API base URL (`LIZARD_API_URL`). Defaults to the cloud. */
++  apiUrl?: string;
++  /** Catalog template to boot (`LIZARD_TEMPLATE`). Defaults to `base`. */
++  template?: string;
++  /** Explicit sandbox size (`LIZARD_SIZE`); otherwise derived from memory. */
++  size?: 'nano' | 'mini' | 'small' | 'medium' | 'large' | 'big';
++  /** Sandbox lifetime in milliseconds, applied at create and restore. */
++  timeoutMs?: number;
++  /** Maximum time to wait for snapshot readiness. */
++  readinessTimeoutMs?: number;
++  /** Poll interval for detached-command log streaming. */
++  pollIntervalMs?: number;
++}
++
+ export type ComputeProviderFactoryOptions = (
+   | {
+       provider: 'modal';
+@@ -511,6 +533,10 @@ export type ComputeProviderFactoryOptions = (
+       provider: 'sprites';
+       config?: SpritesConfig;
+     }
++  | {
++      provider: 'lizard';
++      config?: LizardConfig;
++    }
+   | {
+       provider: 'azure';
+       config?: AzureConfig;
+diff --git a/packages/types/src/compute-providers/capabilities.ts b/packages/types/src/compute-providers/capabilities.ts
+index 9d7e45e..6e71d17 100644
+--- a/packages/types/src/compute-providers/capabilities.ts
++++ b/packages/types/src/compute-providers/capabilities.ts
+@@ -167,6 +167,30 @@ export const SPRITES_CAPABILITIES: ComputeProviderCapabilities = {
+   credentialEgress: 'api_proxy',
+ };
+ 
++/**
++ * Lizard sandboxes are Firecracker microVMs with a real SDK surface, so this
++ * provider supports the full Roomote contract: native exit codes, per-port
++ * preview URLs, filesystem snapshots restored into the same project, and
++ * pause/resume standby.
++ */
++export const LIZARD_CAPABILITIES: ComputeProviderCapabilities = {
++  supportsCreateInstance: true,
++  supportsDestroyInstance: true,
++  supportsCommandExecution: true,
++  supportsCommandOutputStreaming: true,
++  // Detached commands append to a log file read back through the SDK fs API.
++  supportsCommandOutputLookup: true,
++  supportsSnapshots: true,
++  supportsStandbyResume: true,
++  supportsResume: true,
++  supportsFileWrite: true,
++  // Full Linux guest; Docker runs inside the microVM.
++  supportsDockerProjects: true,
++  // Substitutes are used through the API-side credential egress proxy; see
++  // MODAL_CAPABILITIES.
++  credentialEgress: 'api_proxy',
++};
++
+ export const AZURE_CAPABILITIES: ComputeProviderCapabilities = {
+   supportsCreateInstance: true,
+   supportsDestroyInstance: true,
+@@ -207,6 +231,8 @@ export function getComputeProviderCapabilities(
+       return BOX_CAPABILITIES;
+     case 'sprites':
+       return SPRITES_CAPABILITIES;
++    case 'lizard':
++      return LIZARD_CAPABILITIES;
+     case 'azure':
+       return AZURE_CAPABILITIES;
+     default: {
+diff --git a/packages/types/src/compute-providers/compute-provider.ts b/packages/types/src/compute-providers/compute-provider.ts
+index 08383d0..bf0e162 100644
+--- a/packages/types/src/compute-providers/compute-provider.ts
++++ b/packages/types/src/compute-providers/compute-provider.ts
+@@ -14,6 +14,7 @@ export const computeProviders = [
+   'blaxel',
+   'box',
+   'sprites',
++  'lizard',
+   'roomote',
+   'azure',
+ ] as const;
+@@ -31,6 +32,7 @@ export const snapshotCapableComputeProviders = [
+   'roomote',
+   'azure',
+   'box',
++  'lizard',
+ ] as const satisfies readonly ComputeProvider[];
+ 
+ /**
+@@ -43,6 +45,7 @@ export const standbyResumeCapableComputeProviders = [
+   'blaxel',
+   'box',
+   'sprites',
++  'lizard',
+   'azure',
+ ] as const satisfies readonly ComputeProvider[];
+ 
+@@ -57,6 +60,7 @@ export const sleepCheckManagedComputeProviders = [
+   'blaxel',
+   'box',
+   'sprites',
++  'lizard',
+ ] as const satisfies readonly ComputeProvider[];
+ 
+ export const isComputeProvider = (
+@@ -165,6 +169,15 @@ export const SPRITES_WORKER_RUNTIME_PATHS: RuntimePathsWithoutEnvironment =
+     ...SANDBOX_WORKER_RUNTIME_PATHS,
+   });
+ 
++/**
++ * Lizard sandboxes are Firecracker microVMs that boot from a catalog template,
++ * so they use the shared hosted-sandbox filesystem layout.
++ */
++export const LIZARD_WORKER_RUNTIME_PATHS: RuntimePathsWithoutEnvironment =
++  Object.freeze({
++    ...SANDBOX_WORKER_RUNTIME_PATHS,
++  });
++
+ /**
+  * Azure Container Apps sandboxes boot from a disk image baked from the same
+  * worker OCI image as the other hosted providers, so they share the Vercel
+@@ -192,6 +205,7 @@ const RUNTIME_PATHS_BY_ENVIRONMENT: Record<
+   blaxel: BLAXEL_WORKER_RUNTIME_PATHS,
+   box: BOX_WORKER_RUNTIME_PATHS,
+   sprites: SPRITES_WORKER_RUNTIME_PATHS,
++  lizard: LIZARD_WORKER_RUNTIME_PATHS,
+   roomote: MODAL_WORKER_RUNTIME_PATHS,
+   azure: AZURE_WORKER_RUNTIME_PATHS,
+   local: LOCAL_WORKER_RUNTIME_PATHS,
+diff --git a/packages/types/src/compute-providers/worker-context.ts b/packages/types/src/compute-providers/worker-context.ts
+index 1b15872..7755e9a 100644
+--- a/packages/types/src/compute-providers/worker-context.ts
++++ b/packages/types/src/compute-providers/worker-context.ts
+@@ -16,6 +16,7 @@ export type WorkerComputeProviderLabel =
+   | 'blaxel'
+   | 'box'
+   | 'sprites'
++  | 'lizard'
+   | 'azure';
+ 
+ export type WorkerComputeProviderFingerprintKind = 'base-image' | 'runtime';
+@@ -31,6 +32,7 @@ export function getWorkerComputeProviderLabel(
+     case 'blaxel':
+     case 'box':
+     case 'sprites':
++    case 'lizard':
+     case 'azure':
+       return provider;
+     // Roomote Cloud workers run inside Modal sandboxes, so worker-side

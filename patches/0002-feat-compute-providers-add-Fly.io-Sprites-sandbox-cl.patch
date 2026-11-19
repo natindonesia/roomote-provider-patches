@@ -1,0 +1,881 @@
+From f97abff87fa1e183827d183016cdc29e59ddbacb Mon Sep 17 00:00:00 2001
+From: Ticlext-Altihaf <hi@ticlext.top>
+Date: Thu, 19 Nov 2026 03:25:28 +0100
+Subject: [PATCH 2/6] feat(compute-providers): add Fly.io Sprites sandbox
+ client
+
+Implements ComputeProviderClient over the Sprites REST API
+(https://api.sprites.dev). Exec is the simple HTTP POST form, wrapped in a
+shell that prints an exit sentinel because the endpoint exposes no exit-code
+channel. Detached commands write a log file that is polled through the
+filesystem API for streaming and lookup.
+---
+ .../compute-providers/src/adapters/index.ts   |   1 +
+ .../compute-providers/src/adapters/sprites.ts | 836 ++++++++++++++++++
+ packages/compute-providers/src/index.ts       |   1 +
+ 3 files changed, 838 insertions(+)
+ create mode 100644 packages/compute-providers/src/adapters/sprites.ts
+
+diff --git a/packages/compute-providers/src/adapters/index.ts b/packages/compute-providers/src/adapters/index.ts
+index cf908ef..3355f9b 100644
+--- a/packages/compute-providers/src/adapters/index.ts
++++ b/packages/compute-providers/src/adapters/index.ts
+@@ -5,4 +5,5 @@ export { DaytonaClient } from './daytona';
+ export { E2bClient } from './e2b';
+ export { BlaxelClient } from './blaxel';
+ export { BoxClient } from './box';
++export { SpritesClient } from './sprites';
+ export { AzureClient } from './azure';
+diff --git a/packages/compute-providers/src/adapters/sprites.ts b/packages/compute-providers/src/adapters/sprites.ts
+new file mode 100644
+index 0000000..efcba90
+--- /dev/null
++++ b/packages/compute-providers/src/adapters/sprites.ts
+@@ -0,0 +1,836 @@
++import { randomUUID } from 'node:crypto';
++
++import {
++  SANDBOX_SERVER_PORT,
++  SPRITES_CAPABILITIES as SPRITES_CAPABILITIES_VALUE,
++  type ComputeProvider,
++} from '@roomote/types';
++
++import { sleepWithSignal, throwIfAborted } from '../modal/abort';
++import type {
++  CommandOutputEvent,
++  ComputeInstanceStatus,
++  ComputeProviderCapabilities,
++  ComputeProviderClient,
++  CreateInstanceInput,
++  CreateSnapshotInput,
++  CreateSnapshotResult,
++  CreatedInstance,
++  DestroyInstanceInput,
++  DestroyInstanceResult,
++  EnterStandbyInput,
++  EnterStandbyResult,
++  GetCommandOutputInput,
++  GetInstanceDomainsInput,
++  GetInstanceDomainsResult,
++  GetInstanceStatusInput,
++  GetInstanceStatusResult,
++  InstanceSummary,
++  ListInstancesInput,
++  ResumeFromStandbyInput,
++  ResumeInstanceInput,
++  RunCommandInput,
++  RunCommandResult,
++  SpritesConfig,
++  StreamCommandOutputInput,
++  WriteFileInput,
++} from '../types';
++
++export const DEFAULT_SPRITES_API_BASE_URL = 'https://api.sprites.dev';
++
++/**
++ * Detached commands write to a log file inside the sprite; the command id is
++ * the log path so log lookups need no server-side session bookkeeping.
++ */
++export const SPRITES_DETACHED_LOG_DIR = '/tmp/roomote-exec';
++export const SPRITES_COMMAND_ID_PREFIX = 'sprites-log:';
++
++const SPRITES_PATH = '/v1/sprites';
++const DEFAULT_POLL_INTERVAL_MS = 1_000;
++const DEFAULT_READINESS_TIMEOUT_MS = 5 * 60_000;
++
++/**
++ * The simple HTTP exec endpoint has no documented exit-code channel, so every
++ * command is wrapped in a shell that prints a sentinel before the command's
++ * own output is parsed.
++ */
++const EXIT_SENTINEL = '__ROOMOTE_EXIT__';
++
++const READY_SPRITE_STATES = new Set(['warm', 'running']);
++const STOPPED_SPRITE_STATES = new Set(['cold']);
++
++export class SpritesApiError extends Error {
++  public constructor(
++    message: string,
++    public readonly status: number,
++    public readonly body: string,
++  ) {
++    super(message);
++    this.name = 'SpritesApiError';
++  }
++}
++
++interface SpritesApiResource {
++  id?: string;
++  name?: string;
++  organization?: string;
++  url?: string;
++  status?: string;
++  created_at?: string;
++  updated_at?: string;
++  labels?: string[];
++  services?: Record<
++    string,
++    {
++      endpoint?: { port?: number; protocol?: string };
++      exposure?: string;
++      public_url?: string;
++      internal_url?: string;
++    }
++  >;
++}
++
++interface SpritesApiListResponse {
++  sprites?: SpritesApiResource[];
++  has_more?: boolean;
++  next_continuation_token?: string;
++}
++
++interface ParsedCommandOutput {
++  stdout: string;
++  stderr: string;
++  exitCode: number | null;
++}
++
++export class SpritesClient implements ComputeProviderClient {
++  public readonly vendor: ComputeProvider = 'sprites';
++
++  public readonly capabilities: ComputeProviderCapabilities =
++    SPRITES_CAPABILITIES_VALUE;
++
++  private readonly baseUrl: string;
++  private readonly fetchImpl: typeof fetch;
++
++  public constructor(private readonly config: SpritesConfig) {
++    if (!config.apiToken) {
++      throw new Error('Sprites requires an apiToken');
++    }
++
++    if (config.timeoutMs !== undefined) {
++      assertPositiveNumber(config.timeoutMs, 'Sprites timeoutMs');
++    }
++
++    this.baseUrl = (config.apiBaseUrl ?? DEFAULT_SPRITES_API_BASE_URL).replace(
++      /\/+$/,
++      '',
++    );
++    this.fetchImpl = config.fetchImpl ?? fetch;
++  }
++
++  public async listInstances(
++    input: ListInstancesInput,
++  ): Promise<InstanceSummary[]> {
++    const results: InstanceSummary[] = [];
++    let continuationToken: string | undefined;
++
++    do {
++      throwIfAborted(input.signal);
++
++      const response = await this.request<SpritesApiListResponse>(
++        'GET',
++        SPRITES_PATH,
++        {
++          signal: input.signal,
++          ...(continuationToken
++            ? { query: { continuation_token: continuationToken } }
++            : {}),
++        },
++      );
++
++      for (const sprite of response.sprites ?? []) {
++        results.push(summarizeSprite(sprite));
++      }
++
++      continuationToken = response.has_more
++        ? response.next_continuation_token
++        : undefined;
++    } while (continuationToken);
++
++    return results;
++  }
++
++  public async getInstanceStatus(
++    input: GetInstanceStatusInput,
++  ): Promise<GetInstanceStatusResult> {
++    try {
++      const sprite = await this.getSprite(input.instanceId, input.signal);
++
++      return { status: mapSpriteState(sprite.status) };
++    } catch (error) {
++      if (isSpritesNotFound(error)) {
++        return { status: 'stopped' };
++      }
++
++      throw error;
++    }
++  }
++
++  public async createInstance(
++    input: CreateInstanceInput,
++  ): Promise<CreatedInstance> {
++    throwIfAborted(input.signal);
++
++    const name = deriveSpritesInstanceName(
++      input.idempotencyKey ?? input.metadata?.['taskRunId'],
++    );
++
++    const sprite = await this.request<SpritesApiResource>(
++      'POST',
++      SPRITES_PATH,
++      {
++        body: {
++          name,
++          // Private by default: the sprite URL is org-scoped, matching the
++          // trust model of the other providers' private preview domains.
++          url_settings: { auth: 'sprite' },
++        },
++        signal: input.signal,
++      },
++    );
++
++    const instanceId = sprite.name ?? sprite.id;
++
++    if (!instanceId) {
++      throw new Error('Sprites create response did not include a name or id');
++    }
++
++    try {
++      const ready = await this.waitUntilReady(instanceId, input.signal);
++      const domains = await this.resolveDomains(
++        ready,
++        input.ports,
++        input.signal,
++      );
++
++      return {
++        instanceId,
++        status: mapSpriteState(ready.status),
++        ...(domains ? { domains } : {}),
++      };
++    } catch (error) {
++      await this.destroyInstance({ instanceId }).catch(() => {});
++      throw error;
++    }
++  }
++
++  public async destroyInstance(
++    input: DestroyInstanceInput,
++  ): Promise<DestroyInstanceResult> {
++    try {
++      await this.request('DELETE', spritePath(input.instanceId), {
++        signal: input.signal,
++      });
++    } catch (error) {
++      if (isSpritesNotFound(error)) {
++        return {};
++      }
++
++      throw error;
++    }
++
++    return {};
++  }
++
++  /**
++   * Sprites hibernate on their own: an idle sprite drops to `warm` and then
++   * `cold` with no compute charge, keeping its ext4 disk. Entering standby is
++   * therefore a no-op, and the sprite name doubles as the resume handle.
++   */
++  public async enterStandby(
++    input: EnterStandbyInput,
++  ): Promise<EnterStandbyResult> {
++    throwIfAborted(input.signal);
++
++    return { resumeHandle: input.instanceId };
++  }
++
++  public async resumeFromStandby(
++    input: ResumeFromStandbyInput,
++  ): Promise<CreatedInstance> {
++    throwIfAborted(input.signal);
++
++    // A cold sprite wakes on the next request; a cheap command is the
++    // documented way to force the transition without waiting for inbound
++    // traffic.
++    await this.runCommand({
++      instanceId: input.resumeHandle,
++      cmd: 'true',
++      signal: input.signal,
++    });
++
++    const ready = await this.waitUntilReady(input.resumeHandle, input.signal);
++    const domains = await this.resolveDomains(
++      ready,
++      input.ports,
++      input.signal,
++    );
++
++    return {
++      instanceId: input.resumeHandle,
++      sourceSnapshotId: input.resumeHandle,
++      status: mapSpriteState(ready.status),
++      ...(domains ? { domains } : {}),
++    };
++  }
++
++  public async getInstanceDomains(
++    input: GetInstanceDomainsInput,
++  ): Promise<GetInstanceDomainsResult> {
++    const sprite = await this.getSprite(input.instanceId, input.signal);
++
++    return {
++      domains: (await this.resolveDomains(sprite, input.ports, input.signal)) ?? {},
++    };
++  }
++
++  public async runCommand(input: RunCommandInput): Promise<RunCommandResult> {
++    throwIfAborted(input.signal);
++
++    if (input.detached) {
++      return this.runDetachedCommand(input);
++    }
++
++    const script = buildMarkedScript(input);
++    const raw = await this.exec(input.instanceId, script, input);
++    const parsed = parseMarkedOutput(raw);
++
++    if (input.onOutput) {
++      if (parsed.stdout) {
++        input.onOutput({ stream: 'stdout', data: parsed.stdout });
++      }
++
++      if (parsed.stderr) {
++        input.onOutput({ stream: 'stderr', data: parsed.stderr });
++      }
++    }
++
++    return {
++      exitCode: parsed.exitCode,
++      ...(parsed.stdout ? { stdout: parsed.stdout } : {}),
++      ...(parsed.stderr ? { stderr: parsed.stderr } : {}),
++    };
++  }
++
++  private async runDetachedCommand(
++    input: RunCommandInput,
++  ): Promise<RunCommandResult> {
++    const logPath = `${SPRITES_DETACHED_LOG_DIR}/${randomUUID()}.log`;
++    const script = buildDetachedScript(input, logPath);
++
++    // `exec` returns once the background job is launched; the launch output is
++    // discarded because the real command's output goes to the log file.
++    await this.exec(input.instanceId, script, input);
++
++    const commandId = `${SPRITES_COMMAND_ID_PREFIX}${logPath}`;
++
++    // Surface immediate launch failures as a structured result rather than a
++    // silent detached exit.
++    const output = await this.readLog(input.instanceId, logPath, input.signal);
++
++    if (output !== null) {
++      const parsed = parseMarkedOutput(output);
++
++      if (parsed.exitCode !== null) {
++        if (input.onOutput) {
++          if (parsed.stdout) {
++            input.onOutput({ stream: 'stdout', data: parsed.stdout });
++          }
++
++          if (parsed.stderr) {
++            input.onOutput({ stream: 'stderr', data: parsed.stderr });
++          }
++        }
++
++        return {
++          commandId,
++          exitCode: parsed.exitCode,
++          ...(parsed.stdout ? { stdout: parsed.stdout } : {}),
++          ...(parsed.stderr ? { stderr: parsed.stderr } : {}),
++        };
++      }
++    }
++
++    return { commandId, exitCode: null };
++  }
++
++  public async *streamCommandOutput(
++    input: StreamCommandOutputInput,
++  ): AsyncIterable<CommandOutputEvent> {
++    const logPath = parseSpritesCommandId(input.commandId);
++    let emitted = '';
++
++    while (true) {
++      throwIfAborted(input.signal);
++
++      const content = await this.readLog(
++        input.instanceId,
++        logPath,
++        input.signal,
++      );
++
++      if (content !== null && content.length > emitted.length) {
++        yield { stream: 'stdout', data: content.slice(emitted.length) };
++        emitted = content;
++      }
++
++      const parsed = parseMarkedOutput(emitted);
++
++      if (parsed.exitCode !== null) {
++        return;
++      }
++
++      await sleepWithSignal(this.pollIntervalMs(), input.signal);
++    }
++  }
++
++  public async getCommandOutput(input: GetCommandOutputInput): Promise<string> {
++    const logPath = parseSpritesCommandId(input.commandId);
++    const content = await this.readLog(
++      input.instanceId,
++      logPath,
++      input.signal,
++    );
++
++    return content ?? '';
++  }
++
++  public async writeFiles(input: WriteFileInput): Promise<void> {
++    for (const file of input.files) {
++      throwIfAborted(input.signal);
++
++      const query = new URLSearchParams({
++        path: file.path,
++        workingDir: '/',
++        mkdir: 'true',
++        mode: '0644',
++      });
++
++      await this.request(
++        'PUT',
++        `${spritePath(input.instanceId)}/fs/write?${query.toString()}`,
++        {
++          rawBody: file.content,
++          signal: input.signal,
++        },
++      );
++    }
++  }
++
++  /**
++   * Sprites checkpoints restore into the same sprite, so they cannot satisfy
++   * Roomote's snapshot-then-fork contract. Reported as unsupported by
++   * {@link SPRITES_CAPABILITIES_VALUE}; this throws rather than silently
++   * degrading.
++   */
++  public async createSnapshot(
++    input: CreateSnapshotInput,
++  ): Promise<CreateSnapshotResult> {
++    throw new Error(
++      `Sprites does not support Roomote product snapshots; checkpoint restore is ` +
++        `limited to the source sprite (instance ${input.instanceId})`,
++    );
++  }
++
++  public async resumeFromSnapshot(
++    input: ResumeInstanceInput,
++  ): Promise<CreatedInstance> {
++    throw new Error(
++      `Sprites cannot resume from snapshot ${input.sourceSnapshotId}: ` +
++        `checkpoints are sprite-scoped and ` +
++        `supportsSnapshots is false`,
++    );
++  }
++
++  private async getSprite(
++    instanceId: string,
++    signal?: AbortSignal,
++  ): Promise<SpritesApiResource> {
++    return this.request<SpritesApiResource>('GET', spritePath(instanceId), {
++      signal,
++    });
++  }
++
++  private async waitUntilReady(
++    instanceId: string,
++    signal?: AbortSignal,
++  ): Promise<SpritesApiResource> {
++    const deadline = Date.now() + this.readinessTimeoutMs();
++
++    while (true) {
++      throwIfAborted(signal);
++
++      let sprite: SpritesApiResource;
++
++      try {
++        sprite = await this.getSprite(instanceId, signal);
++      } catch (error) {
++        if (isSpritesNotFound(error)) {
++          throw new Error(
++            `Sprite ${instanceId} disappeared while waiting for readiness`,
++          );
++        }
++
++        throw error;
++      }
++
++      if (READY_SPRITE_STATES.has(sprite.status ?? '')) {
++        return sprite;
++      }
++
++      if (Date.now() >= deadline) {
++        throw new Error(`Timed out waiting for Sprite ${instanceId} readiness`);
++      }
++
++      await sleepWithSignal(this.pollIntervalMs(), signal);
++    }
++  }
++
++  private async exec(
++    instanceId: string,
++    script: string,
++    input: { cwd?: string; env?: Record<string, string>; signal?: AbortSignal },
++  ): Promise<string> {
++    const query = new URLSearchParams();
++    // `cmd` may repeat; command and args are passed through bash so the
++    // sentinel wrapper and redirections are honoured.
++    query.append('cmd', 'bash');
++    query.append('cmd', '-lc');
++    query.append('cmd', script);
++
++    if (input.cwd) {
++      query.append('dir', input.cwd);
++    }
++
++    for (const [key, value] of Object.entries(input.env ?? {})) {
++      query.append('env', `${key}=${value}`);
++    }
++
++    const response = await this.fetchImpl(
++      `${this.baseUrl}${spritePath(instanceId)}/exec?${query.toString()}`,
++      {
++        method: 'POST',
++        headers: this.headers(),
++        ...(input.signal ? { signal: input.signal } : {}),
++      },
++    );
++
++    const body = await response.text();
++
++    if (!response.ok) {
++      throw new SpritesApiError(
++        `Sprites exec failed for ${instanceId} with HTTP ${response.status}`,
++        response.status,
++        body,
++      );
++    }
++
++    return stripControlBytes(body);
++  }
++
++  private async readLog(
++    instanceId: string,
++    logPath: string,
++    signal?: AbortSignal,
++  ): Promise<string | null> {
++    const query = new URLSearchParams({ path: logPath, workingDir: '/' });
++
++    try {
++      const response = await this.fetchImpl(
++        `${this.baseUrl}${spritePath(instanceId)}/fs/read?${query.toString()}`,
++        {
++          method: 'GET',
++          headers: this.headers(),
++          ...(signal ? { signal } : {}),
++        },
++      );
++
++      if (response.status === 404) {
++        return null;
++      }
++
++      if (!response.ok) {
++        throw new SpritesApiError(
++          `Sprites log read failed for ${instanceId} with HTTP ${response.status}`,
++          response.status,
++          await response.text(),
++        );
++      }
++
++      return stripControlBytes(await response.text());
++    } catch (error) {
++      if (isSpritesNotFound(error)) {
++        return null;
++      }
++
++      throw error;
++    }
++  }
++
++  /**
++   * Sprites exposes one HTTP endpoint per sprite URL, plus one `public_url` per
++   * registered service. Map the primary sandbox port to the sprite URL and any
++   * other requested port to a matching service public URL when one exists.
++   */
++  private async resolveDomains(
++    sprite: SpritesApiResource,
++    ports: number[] | undefined,
++    signal?: AbortSignal,
++  ): Promise<Record<string, string> | undefined> {
++    if (!ports || ports.length === 0) {
++      return undefined;
++    }
++
++    throwIfAborted(signal);
++
++    const resolved: Record<string, string> = {};
++    const serviceUrls = new Map<number, string>();
++
++    for (const service of Object.values(sprite.services ?? {})) {
++      const port = service.endpoint?.port;
++      const url = service.public_url;
++
++      if (typeof port === 'number' && url) {
++        serviceUrls.set(port, url);
++      }
++    }
++
++    for (const port of ports) {
++      const serviceUrl = serviceUrls.get(port);
++
++      if (serviceUrl) {
++        resolved[String(port)] = serviceUrl;
++        continue;
++      }
++
++      if (port === SANDBOX_SERVER_PORT && sprite.url) {
++        resolved[String(port)] = sprite.url;
++      }
++    }
++
++    return Object.keys(resolved).length > 0 ? resolved : undefined;
++  }
++
++  private headers(): Record<string, string> {
++    return {
++      authorization: `Bearer ${this.config.apiToken}`,
++      accept: 'application/json, text/plain, */*',
++    };
++  }
++
++  private async request<T = unknown>(
++    method: string,
++    path: string,
++    options?: {
++      body?: unknown;
++      rawBody?: Buffer;
++      query?: Record<string, string>;
++      signal?: AbortSignal;
++    },
++  ): Promise<T> {
++    const query = options?.query
++      ? `?${new URLSearchParams(options.query).toString()}`
++      : '';
++    const headers = this.headers();
++    let body: BodyInit | undefined;
++
++    if (options?.rawBody) {
++      headers['content-type'] = 'application/octet-stream';
++      body = new Uint8Array(options.rawBody);
++    } else if (options?.body !== undefined) {
++      headers['content-type'] = 'application/json';
++      body = JSON.stringify(options.body);
++    }
++
++    const response = await this.fetchImpl(`${this.baseUrl}${path}${query}`, {
++      method,
++      headers,
++      ...(body ? { body } : {}),
++      ...(options?.signal ? { signal: options.signal } : {}),
++    });
++
++    const text = await response.text();
++
++    if (!response.ok) {
++      throw new SpritesApiError(
++        `Sprites API ${method} ${path} failed with HTTP ${response.status}`,
++        response.status,
++        text,
++      );
++    }
++
++    if (!text) {
++      return undefined as T;
++    }
++
++    try {
++      return JSON.parse(text) as T;
++    } catch {
++      return text as unknown as T;
++    }
++  }
++
++  private pollIntervalMs(): number {
++    return this.config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
++  }
++
++  private readinessTimeoutMs(): number {
++    return this.config.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS;
++  }
++}
++
++function spritePath(instanceId: string): string {
++  return `${SPRITES_PATH}/${encodeURIComponent(instanceId)}`;
++}
++
++function summarizeSprite(sprite: SpritesApiResource): InstanceSummary {
++  const instanceId = sprite.name ?? sprite.id;
++
++  if (!instanceId) {
++    throw new Error('Sprites list entry did not include a name or id');
++  }
++
++  return {
++    instanceId,
++    status: mapSpriteState(sprite.status),
++    timeoutRemainingMs: 0,
++    ...(sprite.created_at ? { createdAt: new Date(sprite.created_at) } : {}),
++  };
++}
++
++function mapSpriteState(state: string | undefined): ComputeInstanceStatus {
++  switch (state) {
++    case 'running':
++      return 'running';
++    case 'warm':
++      return 'pending';
++    case 'cold':
++      return 'stopped';
++    default:
++      return STOPPED_SPRITE_STATES.has(state ?? '') ? 'stopped' : 'unknown';
++  }
++}
++
++/**
++ * Wrap a command so its exit code survives an API that returns output only.
++ * Whitespace before the sentinel is trimmed from stdout to keep transcripts
++ * clean.
++ */
++function buildMarkedScript(input: RunCommandInput): string {
++  const envPrefix = Object.entries(input.env ?? {})
++    .map(([key, value]) => `${key}=${shellQuote(value)}`)
++    .join(' ');
++  const command = [input.cmd, ...(input.args ?? [])]
++    .map(shellQuote)
++    .join(' ');
++  const withEnv = envPrefix ? `env ${envPrefix} ${command}` : command;
++  const withCwd = input.cwd ? `cd ${shellQuote(input.cwd)} && ` : '';
++
++  return `${withCwd}${withEnv}; printf '\\n${EXIT_SENTINEL}%s\\n' "$?"`;
++}
++
++function buildDetachedScript(input: RunCommandInput, logPath: string): string {
++  const envPrefix = Object.entries(input.env ?? {})
++    .map(([key, value]) => `${key}=${shellQuote(value)}`)
++    .join(' ');
++  const command = [input.cmd, ...(input.args ?? [])]
++    .map(shellQuote)
++    .join(' ');
++  const withEnv = envPrefix ? `env ${envPrefix} ${command}` : command;
++  const withCwd = input.cwd ? `cd ${shellQuote(input.cwd)} && ` : '';
++  const inner = `${withCwd}${withEnv}; printf '\\n${EXIT_SENTINEL}%s\\n' "$?"`;
++
++  return [
++    `mkdir -p ${shellQuote(SPRITES_DETACHED_LOG_DIR)}`,
++    `setsid bash -lc ${shellQuote(inner)} > ${shellQuote(logPath)} 2>&1 < /dev/null &`,
++    `echo started`,
++  ].join('\n');
++}
++
++function parseMarkedOutput(raw: string): ParsedCommandOutput {
++  const markerIndex = raw.lastIndexOf(EXIT_SENTINEL);
++
++  if (markerIndex === -1) {
++    const { stdout, stderr } = splitMultiplexedStream(raw);
++    return { stdout, stderr, exitCode: null };
++  }
++
++  const exitMatch = raw.slice(markerIndex + EXIT_SENTINEL.length).match(/^(\d+)/);
++  const exitCode = exitMatch ? Number(exitMatch[1]) : null;
++  const body = raw.slice(0, markerIndex).replace(/\n+$/, '');
++  const { stdout, stderr } = splitMultiplexedStream(body);
++
++  return { stdout, stderr, exitCode };
++}
++
++/**
++ * The simple HTTP exec endpoint multiplexes both streams into one body. Without
++ * a documented channel marker the merged text is the honest representation, so
++ * it is reported as stdout rather than guessed apart.
++ */
++function splitMultiplexedStream(raw: string): {
++  stdout: string;
++  stderr: string;
++} {
++  return { stdout: raw, stderr: '' };
++}
++
++/**
++ * Sprites' HTTP exec frames output with control bytes; drop C0 controls except
++ * tab/newline so transcripts stay readable.
++ */
++function stripControlBytes(value: string): string {
++  // eslint-disable-next-line no-control-regex
++  return value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '');
++}
++
++function parseSpritesCommandId(commandId: string): string {
++  if (!commandId.startsWith(SPRITES_COMMAND_ID_PREFIX)) {
++    throw new Error(
++      `Invalid Sprites command ID "${commandId}"; expected "${SPRITES_COMMAND_ID_PREFIX}<logPath>"`,
++    );
++  }
++
++  return commandId.slice(SPRITES_COMMAND_ID_PREFIX.length);
++}
++
++export function deriveSpritesInstanceName(seed?: string): string {
++  const sanitized = (seed ?? '')
++    .toLowerCase()
++    .replace(/[^a-z0-9-]/g, '-')
++    .replace(/-+/g, '-')
++    .replace(/^-|-$/g, '')
++    .slice(0, 40);
++  const suffix = randomUUID().replace(/-/g, '').slice(0, 8);
++
++  return sanitized ? `${sanitized}-${suffix}` : `roomote-${suffix}`;
++}
++
++function isSpritesNotFound(error: unknown): boolean {
++  return error instanceof SpritesApiError && error.status === 404;
++}
++
++function assertPositiveNumber(value: number, label: string): void {
++  if (!Number.isFinite(value) || value <= 0) {
++    throw new Error(`${label} must be a positive number`);
++  }
++}
++
++const SHELL_SAFE_PATTERN = /^[A-Za-z0-9_@%+=:,./-]+$/;
++
++function shellQuote(value: string): string {
++  if (value.length > 0 && SHELL_SAFE_PATTERN.test(value)) {
++    return value;
++  }
++
++  return `'${value.replaceAll("'", `'\\''`)}'`;
++}
+diff --git a/packages/compute-providers/src/index.ts b/packages/compute-providers/src/index.ts
+index 9129aa2..39072c9 100644
+--- a/packages/compute-providers/src/index.ts
++++ b/packages/compute-providers/src/index.ts
+@@ -21,5 +21,6 @@ export * from './adapters/blaxel';
+ export * from './blaxel';
+ export * from './adapters/box';
+ export * from './box';
++export * from './adapters/sprites';
+ export * from './adapters/azure';
+ export * from './azure';

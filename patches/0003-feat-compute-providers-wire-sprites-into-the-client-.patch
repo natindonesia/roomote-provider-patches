@@ -1,0 +1,80 @@
+From c2d22284f77dbe9be1af5c1fc6edd2e6e539c6b8 Mon Sep 17 00:00:00 2001
+From: Ticlext-Altihaf <hi@ticlext.top>
+Date: Thu, 19 Nov 2026 03:25:28 +0100
+Subject: [PATCH 3/6] feat(compute-providers): wire sprites into the client
+ factory
+
+Reads SPRITE_TOKEN plus optional SPRITES_API_BASE_URL, SPRITES_ORGANIZATION,
+SPRITES_TIMEOUT_MS and SPRITES_SIZE.
+---
+ packages/compute-providers/src/factory.ts | 39 +++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/packages/compute-providers/src/factory.ts b/packages/compute-providers/src/factory.ts
+index 9292af1..70fd5a7 100644
+--- a/packages/compute-providers/src/factory.ts
++++ b/packages/compute-providers/src/factory.ts
+@@ -16,6 +16,7 @@ import type {
+   DaytonaConfig,
+   E2bConfig,
+   ModalConfig,
++  SpritesConfig,
+ } from './types';
+ import { assertDefined } from './errors';
+ import {
+@@ -26,6 +27,7 @@ import {
+   E2bClient,
+   BlaxelClient,
+   BoxClient,
++  SpritesClient,
+   AzureClient,
+ } from './adapters';
+ 
+@@ -383,6 +385,35 @@ export function createComputeProviderClient(
+       return new BoxClient(config);
+     }
+ 
++    case 'sprites': {
++      const apiToken =
++        options.config?.apiToken ?? envValue('SPRITE_TOKEN');
++      const apiBaseUrl =
++        options.config?.apiBaseUrl ?? envValue('SPRITES_API_BASE_URL');
++      const organization =
++        options.config?.organization ?? envValue('SPRITES_ORGANIZATION');
++      const timeoutMs = parsePositiveNumber(envValue('SPRITES_TIMEOUT_MS'));
++      const size = parseSpritesSize(envValue('SPRITES_SIZE'));
++
++      assertDefined(apiToken, 'Missing SPRITE_TOKEN');
++
++      const config: SpritesConfig = {
++        ...(options.config ?? {}),
++        apiToken,
++        ...(options.config?.apiBaseUrl === undefined && apiBaseUrl
++          ? { apiBaseUrl }
++          : {}),
++        ...(options.config?.organization === undefined && organization
++          ? { organization }
++          : {}),
++        ...(options.config?.timeoutMs === undefined && timeoutMs !== undefined
++          ? { timeoutMs }
++          : {}),
++        ...(options.config?.size === undefined && size ? { size } : {}),
++      };
++      return new SpritesClient(config);
++    }
++
+     case 'azure': {
+       const subscriptionId =
+         options.config?.subscriptionId ?? envValue('AZURE_SUBSCRIPTION_ID');
+@@ -495,3 +526,11 @@ function parseBoxMachineType(
+   }
+   throw new Error('BOX_MACHINE_TYPE must be one of: small, default, large');
+ }
++
++function parseSpritesSize(value: string | undefined): SpritesConfig['size'] {
++  if (value === undefined) return undefined;
++  if (value === 'small' || value === 'default' || value === 'large') {
++    return value;
++  }
++  throw new Error('SPRITES_SIZE must be one of: small, default, large');
++}

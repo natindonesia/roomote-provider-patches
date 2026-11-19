@@ -1,0 +1,183 @@
+From 91e07f893506031790ce616d282a1940160d2595 Mon Sep 17 00:00:00 2001
+From: Ticlext-Altihaf <hi@ticlext.top>
+Date: Thu, 19 Nov 2026 03:25:28 +0100
+Subject: [PATCH 1/6] feat(types): register sprites as a compute provider
+
+Adds 'sprites' to the provider enum, the standby-resume and sleep-check
+sets, the worker runtime path table, the capability matrix, the worker
+context label, and the SpritesConfig shape.
+
+Sprites is standby-resume shaped, not snapshot shaped: the checkpoint API
+restores into the source sprite, so it cannot back a snapshot-then-fork
+contract. supportsSnapshots is therefore false.
+---
+ packages/compute-providers/src/types.ts       | 26 ++++++++++++++++
+ .../src/compute-providers/capabilities.ts     | 30 +++++++++++++++++++
+ .../src/compute-providers/compute-provider.ts | 13 ++++++++
+ .../src/compute-providers/worker-context.ts   |  2 ++
+ 4 files changed, 71 insertions(+)
+
+diff --git a/packages/compute-providers/src/types.ts b/packages/compute-providers/src/types.ts
+index 0f83f3f..f72061a 100644
+--- a/packages/compute-providers/src/types.ts
++++ b/packages/compute-providers/src/types.ts
+@@ -451,6 +451,28 @@ export interface BoxConfig {
+   fetchImpl?: typeof fetch;
+ }
+ 
++export interface SpritesConfig {
++  /** Fly.io Sprites API bearer token (`SPRITE_TOKEN`). */
++  apiToken: string;
++  /** Sprites API base URL (`SPRITES_API_BASE_URL`). */
++  apiBaseUrl?: string;
++  /**
++   * Organization slug used to build `<name>-<org>.sprites.app` URLs when the
++   * API omits an explicit `url`. Optional; the API returns `url` on create.
++   */
++  organization?: string;
++  /** Idle timeout hint in milliseconds (`SPRITES_TIMEOUT_MS`); advisory only. */
++  timeoutMs?: number;
++  /** Sprite size label forwarded as a metadata hint (`SPRITES_SIZE`). */
++  size?: 'small' | 'default' | 'large';
++  /** Maximum time to wait for create/resume readiness. */
++  readinessTimeoutMs?: number;
++  /** Poll interval for sprite status and detached-command logs. */
++  pollIntervalMs?: number;
++  /** Test seam; defaults to global fetch. */
++  fetchImpl?: typeof fetch;
++}
++
+ export type ComputeProviderFactoryOptions = (
+   | {
+       provider: 'modal';
+@@ -485,6 +507,10 @@ export type ComputeProviderFactoryOptions = (
+       provider: 'box';
+       config?: BoxConfig;
+     }
++  | {
++      provider: 'sprites';
++      config?: SpritesConfig;
++    }
+   | {
+       provider: 'azure';
+       config?: AzureConfig;
+diff --git a/packages/types/src/compute-providers/capabilities.ts b/packages/types/src/compute-providers/capabilities.ts
+index ee3cf87..9d7e45e 100644
+--- a/packages/types/src/compute-providers/capabilities.ts
++++ b/packages/types/src/compute-providers/capabilities.ts
+@@ -139,6 +139,34 @@ export const BOX_CAPABILITIES: ComputeProviderCapabilities = {
+   credentialEgress: 'api_proxy',
+ };
+ 
++/**
++ * Fly.io Sprites are persistent, hardware-isolated Ubuntu VMs.
++ *
++ * Snapshots are deliberately unsupported: the Sprites checkpoint API restores
++ * into the *same* Sprite (`POST /v1/sprites/{name}/checkpoints/{id}/restore`),
++ * so a checkpoint cannot back Roomote's snapshot-then-destroy-then-fork
++ * contract. Sprites instead idle to `warm`/`cold` on their own, which is
++ * exactly the standby-resume shape.
++ */
++export const SPRITES_CAPABILITIES: ComputeProviderCapabilities = {
++  supportsCreateInstance: true,
++  supportsDestroyInstance: true,
++  supportsCommandExecution: true,
++  // Poll-based streaming over a detached-command log file read via the
++  // filesystem API.
++  supportsCommandOutputStreaming: true,
++  supportsCommandOutputLookup: true,
++  supportsSnapshots: false,
++  supportsStandbyResume: true,
++  supportsResume: true,
++  supportsFileWrite: true,
++  // Sprites are full Ubuntu VMs with Docker pre-installed.
++  supportsDockerProjects: true,
++  // Substitutes are used through the API-side credential egress proxy; see
++  // MODAL_CAPABILITIES.
++  credentialEgress: 'api_proxy',
++};
++
+ export const AZURE_CAPABILITIES: ComputeProviderCapabilities = {
+   supportsCreateInstance: true,
+   supportsDestroyInstance: true,
+@@ -177,6 +205,8 @@ export function getComputeProviderCapabilities(
+       return BLAXEL_CAPABILITIES;
+     case 'box':
+       return BOX_CAPABILITIES;
++    case 'sprites':
++      return SPRITES_CAPABILITIES;
+     case 'azure':
+       return AZURE_CAPABILITIES;
+     default: {
+diff --git a/packages/types/src/compute-providers/compute-provider.ts b/packages/types/src/compute-providers/compute-provider.ts
+index 6a0cd29..08383d0 100644
+--- a/packages/types/src/compute-providers/compute-provider.ts
++++ b/packages/types/src/compute-providers/compute-provider.ts
+@@ -13,6 +13,7 @@ export const computeProviders = [
+   'e2b',
+   'blaxel',
+   'box',
++  'sprites',
+   'roomote',
+   'azure',
+ ] as const;
+@@ -41,6 +42,7 @@ export const standbyResumeCapableComputeProviders = [
+   'docker',
+   'blaxel',
+   'box',
++  'sprites',
+   'azure',
+ ] as const satisfies readonly ComputeProvider[];
+ 
+@@ -54,6 +56,7 @@ export const sleepCheckManagedComputeProviders = [
+   'docker',
+   'blaxel',
+   'box',
++  'sprites',
+ ] as const satisfies readonly ComputeProvider[];
+ 
+ export const isComputeProvider = (
+@@ -153,6 +156,15 @@ export const BOX_WORKER_RUNTIME_PATHS: RuntimePathsWithoutEnvironment =
+     ...SANDBOX_WORKER_RUNTIME_PATHS,
+   });
+ 
++/**
++ * Fly.io Sprites are persistent Ubuntu VMs with a full ext4 root, so the shared
++ * hosted-sandbox filesystem layout is available unchanged.
++ */
++export const SPRITES_WORKER_RUNTIME_PATHS: RuntimePathsWithoutEnvironment =
++  Object.freeze({
++    ...SANDBOX_WORKER_RUNTIME_PATHS,
++  });
++
+ /**
+  * Azure Container Apps sandboxes boot from a disk image baked from the same
+  * worker OCI image as the other hosted providers, so they share the Vercel
+@@ -179,6 +191,7 @@ const RUNTIME_PATHS_BY_ENVIRONMENT: Record<
+   e2b: E2B_WORKER_RUNTIME_PATHS,
+   blaxel: BLAXEL_WORKER_RUNTIME_PATHS,
+   box: BOX_WORKER_RUNTIME_PATHS,
++  sprites: SPRITES_WORKER_RUNTIME_PATHS,
+   roomote: MODAL_WORKER_RUNTIME_PATHS,
+   azure: AZURE_WORKER_RUNTIME_PATHS,
+   local: LOCAL_WORKER_RUNTIME_PATHS,
+diff --git a/packages/types/src/compute-providers/worker-context.ts b/packages/types/src/compute-providers/worker-context.ts
+index a816652..1b15872 100644
+--- a/packages/types/src/compute-providers/worker-context.ts
++++ b/packages/types/src/compute-providers/worker-context.ts
+@@ -15,6 +15,7 @@ export type WorkerComputeProviderLabel =
+   | 'e2b'
+   | 'blaxel'
+   | 'box'
++  | 'sprites'
+   | 'azure';
+ 
+ export type WorkerComputeProviderFingerprintKind = 'base-image' | 'runtime';
+@@ -29,6 +30,7 @@ export function getWorkerComputeProviderLabel(
+     case 'e2b':
+     case 'blaxel':
+     case 'box':
++    case 'sprites':
+     case 'azure':
+       return provider;
+     // Roomote Cloud workers run inside Modal sandboxes, so worker-side
