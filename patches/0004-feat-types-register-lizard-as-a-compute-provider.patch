@@ -1,18 +1,18 @@
-From 6a1d07969f72c81147d4fad04a5df81f5ccf53dd Mon Sep 17 00:00:00 2001
+From dc5d8e1556d97f21950a4bb383294b513b8447c9 Mon Sep 17 00:00:00 2001
 From: Ticlext-Altihaf <hi@ticlext.top>
 Date: Thu, 19 Nov 2026 03:28:06 +0100
-Subject: [PATCH 4/6] feat(types): register lizard as a compute provider
+Subject: [PATCH 4/7] feat(types): register lizard as a compute provider
 
 Lizard is the only provider of the set that satisfies the full Roomote
 contract: native exit codes, per-port preview URLs, filesystem snapshots
 restored into the same project, and pause/resume standby. It is therefore
 listed in both the snapshot-capable and standby-capable sets.
 ---
- packages/compute-providers/src/types.ts       | 26 +++++++++++++++++++
- .../src/compute-providers/capabilities.ts     | 26 +++++++++++++++++++
+ packages/compute-providers/src/types.ts       | 26 ++++++++++++++++++
+ .../src/compute-providers/capabilities.ts     | 27 +++++++++++++++++++
  .../src/compute-providers/compute-provider.ts | 14 ++++++++++
  .../src/compute-providers/worker-context.ts   |  2 ++
- 4 files changed, 68 insertions(+)
+ 4 files changed, 69 insertions(+)
 
 diff --git a/packages/compute-providers/src/types.ts b/packages/compute-providers/src/types.ts
 index f72061a..d34c15e 100644
@@ -59,10 +59,10 @@ index f72061a..d34c15e 100644
        provider: 'azure';
        config?: AzureConfig;
 diff --git a/packages/types/src/compute-providers/capabilities.ts b/packages/types/src/compute-providers/capabilities.ts
-index 9d7e45e..6e71d17 100644
+index 9d7e45e..81537ad 100644
 --- a/packages/types/src/compute-providers/capabilities.ts
 +++ b/packages/types/src/compute-providers/capabilities.ts
-@@ -167,6 +167,30 @@ export const SPRITES_CAPABILITIES: ComputeProviderCapabilities = {
+@@ -167,6 +167,31 @@ export const SPRITES_CAPABILITIES: ComputeProviderCapabilities = {
    credentialEgress: 'api_proxy',
  };
  
@@ -83,8 +83,9 @@ index 9d7e45e..6e71d17 100644
 +  supportsStandbyResume: true,
 +  supportsResume: true,
 +  supportsFileWrite: true,
-+  // Full Linux guest; Docker runs inside the microVM.
-+  supportsDockerProjects: true,
++  // Lizard's catalog templates ship Node, git and Python but not a Docker
++  // daemon; the microVM runs the sandbox workload directly.
++  supportsDockerProjects: false,
 +  // Substitutes are used through the API-side credential egress proxy; see
 +  // MODAL_CAPABILITIES.
 +  credentialEgress: 'api_proxy',
@@ -93,7 +94,7 @@ index 9d7e45e..6e71d17 100644
  export const AZURE_CAPABILITIES: ComputeProviderCapabilities = {
    supportsCreateInstance: true,
    supportsDestroyInstance: true,
-@@ -207,6 +231,8 @@ export function getComputeProviderCapabilities(
+@@ -207,6 +232,8 @@ export function getComputeProviderCapabilities(
        return BOX_CAPABILITIES;
      case 'sprites':
        return SPRITES_CAPABILITIES;

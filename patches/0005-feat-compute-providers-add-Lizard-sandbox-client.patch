@@ -1,7 +1,7 @@
-From cb65804a2dee6a7cac2be72e1fd6ead35ae77afc Mon Sep 17 00:00:00 2001
+From 07eda31d8e40b4f294e201f0c9f3a054849f930e Mon Sep 17 00:00:00 2001
 From: Ticlext-Altihaf <hi@ticlext.top>
 Date: Thu, 19 Nov 2026 03:28:06 +0100
-Subject: [PATCH 5/6] feat(compute-providers): add Lizard sandbox client
+Subject: [PATCH 5/7] feat(compute-providers): add Lizard sandbox client
 
 Implements ComputeProviderClient over @lizard-build/sdk 1.0.22. Command
 execution uses the SDK's native argv + exit code path, so no exit sentinel
@@ -10,20 +10,22 @@ back through the SDK filesystem API.
 ---
  packages/compute-providers/package.json       |   1 +
  .../compute-providers/src/adapters/index.ts   |   1 +
- .../compute-providers/src/adapters/lizard.ts  | 615 ++++++++++++++++++
+ .../compute-providers/src/adapters/lizard.ts  | 695 ++++++++++++++++++
  packages/compute-providers/src/index.ts       |   1 +
- 4 files changed, 618 insertions(+)
+ pnpm-lock.yaml                                |   9 +
+ pnpm-workspace.yaml                           |   3 +
+ 6 files changed, 710 insertions(+)
  create mode 100644 packages/compute-providers/src/adapters/lizard.ts
 
 diff --git a/packages/compute-providers/package.json b/packages/compute-providers/package.json
-index 8d862b0..5536f95 100644
+index 8d862b0..14c4bdd 100644
 --- a/packages/compute-providers/package.json
 +++ b/packages/compute-providers/package.json
 @@ -35,6 +35,7 @@
    "dependencies": {
      "@blaxel/core": "0.3.0",
      "@daytonaio/sdk": "^0.190.1",
-+    "@lizard-build/sdk": "^1.0.22",
++    "@lizard-build/sdk": "1.0.22",
      "@roomote/env": "workspace:^",
      "@roomote/types": "workspace:^",
      "@azure/identity": "^4.13.1",
@@ -39,10 +41,10 @@ index 3355f9b..14b0579 100644
  export { AzureClient } from './azure';
 diff --git a/packages/compute-providers/src/adapters/lizard.ts b/packages/compute-providers/src/adapters/lizard.ts
 new file mode 100644
-index 0000000..a7c03e8
+index 0000000..efe6dda
 --- /dev/null
 +++ b/packages/compute-providers/src/adapters/lizard.ts
-@@ -0,0 +1,615 @@
+@@ -0,0 +1,695 @@
 +import { randomUUID } from 'node:crypto';
 +
 +import {
@@ -86,17 +88,23 @@ index 0000000..a7c03e8
 +  WriteFileInput,
 +} from '../types';
 +
-+export const DEFAULT_LIZARD_TEMPLATE = 'base';
++export const DEFAULT_LIZARD_TEMPLATE = 'interpreter';
 +export const DEFAULT_LIZARD_API_URL = 'https://lizard.build';
++/** Two hours, matching the other hosted providers' active-sandbox default. */
++export const DEFAULT_LIZARD_TIMEOUT_MS = 2 * 60 * 60 * 1_000;
 +
-+/** Detached commands write here; the command id is the log path. */
++/**
++ * Detached commands write three sibling files under this directory: `<base>.out`,
++ * `<base>.err`, and `<base>.exit`. The command id encodes `<base>`, so the log
++ * lookup needs no server-side session bookkeeping.
++ */
 +export const LIZARD_DETACHED_LOG_DIR = '/tmp/roomote-exec';
 +export const LIZARD_COMMAND_ID_PREFIX = 'lizard-log:';
++/** Snapshot names carrying this prefix are templates to fork, not standby handles. */
++export const LIZARD_SNAPSHOT_NAME_PREFIX = 'roomote-snap-';
 +
 +const DEFAULT_POLL_INTERVAL_MS = 1_000;
-+const DEFAULT_READINESS_TIMEOUT_MS = 5 * 60_000;
 +const DEFAULT_SNAPSHOT_TIMEOUT_MS = 20 * 60_000;
-+const EXIT_SENTINEL = '__ROOMOTE_EXIT__';
 +
 +type LizardSize = NonNullable<LizardConfig['size']>;
 +
@@ -295,21 +303,18 @@ index 0000000..a7c03e8
 +      return this.runDetachedCommand(sandbox, input);
 +    }
 +
-+    const result = await sandbox.process.exec(
-+      toArgv(input),
-+      {
-+        ...(input.cwd ? { workdir: input.cwd } : {}),
-+        ...(input.env ? { envs: input.env } : {}),
-+        ...(input.onOutput
-+          ? {
-+              onStdout: (data: string) =>
-+                input.onOutput?.({ stream: 'stdout', data }),
-+              onStderr: (data: string) =>
-+                input.onOutput?.({ stream: 'stderr', data }),
-+            }
-+          : {}),
-+      },
-+    );
++    const result = await sandbox.process.exec(toArgv(input), {
++      ...(input.cwd ? { workdir: input.cwd } : {}),
++      ...(input.env ? { envs: input.env } : {}),
++      ...(input.onOutput
++        ? {
++            onStdout: (data: string) =>
++              input.onOutput?.({ stream: 'stdout', data }),
++            onStderr: (data: string) =>
++              input.onOutput?.({ stream: 'stderr', data }),
++          }
++        : {}),
++    });
 +
 +    return {
 +      exitCode: result.exitCode,
@@ -322,64 +327,159 @@ index 0000000..a7c03e8
 +    sandbox: Awaited<ReturnType<typeof Sandbox.connect>>,
 +    input: RunCommandInput,
 +  ): Promise<RunCommandResult> {
-+    const logPath = `${LIZARD_DETACHED_LOG_DIR}/${randomUUID()}.log`;
-+    const commandId = `${LIZARD_COMMAND_ID_PREFIX}${logPath}`;
-+    const script = buildDetachedScript(input, logPath);
++    const basePath = `${LIZARD_DETACHED_LOG_DIR}/${randomUUID()}`;
++    const commandId = `${LIZARD_COMMAND_ID_PREFIX}${basePath}`;
++    const script = buildDetachedScript(input, basePath);
 +
++    // `exec` returns once the background job is launched; its launch output is
++    // discarded because the command's real output goes to the log files.
 +    await sandbox.process.exec(['bash', '-lc', script], {
 +      ...(input.env ? { envs: input.env } : {}),
 +    });
 +
-+    const output = await this.readLog(sandbox, logPath);
++    const exitCode = await this.readExitCode(sandbox, basePath);
 +
-+    if (output !== null) {
-+      const parsed = parseMarkedOutput(output);
++    if (exitCode !== null) {
++      const output = await this.readDetachedOutput(sandbox, basePath);
++      emitDetachedOutput(output, input.onOutput);
 +
-+      if (parsed.exitCode !== null) {
-+        emitParsed(parsed, input.onOutput);
++      return {
++        commandId,
++        exitCode,
++        ...(output.stdout ? { stdout: output.stdout } : {}),
++        ...(output.stderr ? { stderr: output.stderr } : {}),
++      };
++    }
 +
-+        return {
-+          commandId,
-+          exitCode: parsed.exitCode,
-+          ...(parsed.stdout ? { stdout: parsed.stdout } : {}),
-+          ...(parsed.stderr ? { stderr: parsed.stderr } : {}),
-+        };
-+      }
++    if (input.onOutput || input.onExit) {
++      void this.monitorDetachedCommand(sandbox, input, commandId).catch(
++        () => {},
++      );
 +    }
 +
 +    return { commandId, exitCode: null };
 +  }
 +
++  private async monitorDetachedCommand(
++    sandbox: Awaited<ReturnType<typeof Sandbox.connect>>,
++    input: RunCommandInput,
++    commandId: string,
++  ): Promise<void> {
++    for await (const update of this.pollDetachedOutput({
++      instanceId: input.instanceId,
++      commandId,
++      signal: input.signal,
++      sandbox,
++    })) {
++      update.events.forEach((event) => input.onOutput?.(event));
++
++      if (update.exitCode !== undefined) {
++        await input.onExit?.({ exitCode: update.exitCode });
++        return;
++      }
++    }
++  }
++
 +  public async *streamCommandOutput(
 +    input: StreamCommandOutputInput,
 +  ): AsyncIterable<CommandOutputEvent> {
-+    const logPath = parseLizardCommandId(input.commandId);
 +    const sandbox = await Sandbox.connect(input.instanceId, this.connection);
-+    let emitted = '';
 +
-+    while (true) {
-+      throwIfAborted(input.signal);
++    for await (const update of this.pollDetachedOutput({
++      ...input,
++      sandbox,
++    })) {
++      yield* update.events;
 +
-+      const content = await this.readLog(sandbox, logPath);
-+
-+      if (content !== null && content.length > emitted.length) {
-+        yield { stream: 'stdout', data: content.slice(emitted.length) };
-+        emitted = content;
-+      }
-+
-+      if (parseMarkedOutput(emitted).exitCode !== null) {
++      if (update.exitCode !== undefined) {
 +        return;
 +      }
-+
-+      await sleepWithSignal(this.pollIntervalMs(), input.signal);
 +    }
 +  }
 +
 +  public async getCommandOutput(input: GetCommandOutputInput): Promise<string> {
-+    const logPath = parseLizardCommandId(input.commandId);
++    const basePath = parseLizardCommandId(input.commandId);
 +    const sandbox = await Sandbox.connect(input.instanceId, this.connection);
++    const output = await this.readDetachedOutput(sandbox, basePath);
 +
-+    return (await this.readLog(sandbox, logPath)) ?? '';
++    if (input.stream === 'stdout') return output.stdout;
++    if (input.stream === 'stderr') return output.stderr;
++
++    return `${output.stdout}${output.stderr}`;
++  }
++
++  private async *pollDetachedOutput(input: {
++    instanceId: string;
++    commandId: string;
++    signal?: AbortSignal;
++    sandbox: Awaited<ReturnType<typeof Sandbox.connect>>;
++  }): AsyncIterable<{
++    events: CommandOutputEvent[];
++    exitCode?: number;
++  }> {
++    const basePath = parseLizardCommandId(input.commandId);
++    let stdoutLength = 0;
++    let stderrLength = 0;
++
++    while (true) {
++      throwIfAborted(input.signal);
++
++      const output = await this.readDetachedOutput(input.sandbox, basePath);
++      const events: CommandOutputEvent[] = [];
++
++      if (output.stdout.length > stdoutLength) {
++        events.push({
++          stream: 'stdout',
++          data: output.stdout.slice(stdoutLength),
++        });
++        stdoutLength = output.stdout.length;
++      }
++
++      if (output.stderr.length > stderrLength) {
++        events.push({
++          stream: 'stderr',
++          data: output.stderr.slice(stderrLength),
++        });
++        stderrLength = output.stderr.length;
++      }
++
++      const exitCode = await this.readExitCode(input.sandbox, basePath);
++
++      if (exitCode !== null) {
++        yield { events, exitCode };
++        return;
++      }
++
++      yield { events };
++      await sleepWithSignal(this.pollIntervalMs(), input.signal);
++    }
++  }
++
++  private async readDetachedOutput(
++    sandbox: Awaited<ReturnType<typeof Sandbox.connect>>,
++    basePath: string,
++  ): Promise<{ stdout: string; stderr: string }> {
++    const [stdout, stderr] = await Promise.all([
++      this.readLog(sandbox, `${basePath}.out`),
++      this.readLog(sandbox, `${basePath}.err`),
++    ]);
++
++    return { stdout: stdout ?? '', stderr: stderr ?? '' };
++  }
++
++  private async readExitCode(
++    sandbox: Awaited<ReturnType<typeof Sandbox.connect>>,
++    basePath: string,
++  ): Promise<number | null> {
++    const raw = await this.readLog(sandbox, `${basePath}.exit`);
++
++    if (raw === null) {
++      return null;
++    }
++
++    const parsed = Number.parseInt(raw.trim(), 10);
++
++    return Number.isInteger(parsed) ? parsed : null;
 +  }
 +
 +  public async writeFiles(input: WriteFileInput): Promise<void> {
@@ -410,9 +510,7 @@ index 0000000..a7c03e8
 +    const ready = await Sandbox.waitForSnapshot(snapshot.id, {
 +      apiKey: this.connection.apiKey,
 +      apiUrl: this.connection.apiUrl,
-+      ...(this.config.readinessTimeoutMs !== undefined
-+        ? { timeoutMs: this.config.readinessTimeoutMs }
-+        : {}),
++      timeoutMs: this.snapshotTimeoutMs(),
 +    });
 +
 +    if (ready.status === 'failed') {
@@ -535,6 +633,10 @@ index 0000000..a7c03e8
 +  private pollIntervalMs(): number {
 +    return this.config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
 +  }
++
++  private snapshotTimeoutMs(): number {
++    return this.config.readinessTimeoutMs ?? DEFAULT_SNAPSHOT_TIMEOUT_MS;
++  }
 +}
 +
 +function summarizeSandbox(info: SandboxInfo): InstanceSummary {
@@ -574,55 +676,35 @@ index 0000000..a7c03e8
 +    : input.cmd;
 +}
 +
-+function buildDetachedScript(input: RunCommandInput, logPath: string): string {
++function buildDetachedScript(input: RunCommandInput, basePath: string): string {
 +  const command = [input.cmd, ...(input.args ?? [])].map(shellQuote).join(' ');
-+  const withCwd = input.cwd ? `cd ${shellQuote(input.cwd)} && ` : '';
-+  const inner = `${withCwd}${command}; printf '\\n${EXIT_SENTINEL}%s\\n' "$?"`;
++  const inner = input.cwd
++    ? `( cd ${shellQuote(input.cwd)} && ${command} )`
++    : `( ${command} )`;
++  const exitFile = `${basePath}.exit`;
++  const wrapped = `${inner}; printf '%s' "$?" > ${shellQuote(exitFile)}`;
 +
 +  return [
 +    `mkdir -p ${shellQuote(LIZARD_DETACHED_LOG_DIR)}`,
-+    `setsid bash -lc ${shellQuote(inner)} > ${shellQuote(logPath)} 2>&1 < /dev/null &`,
++    `setsid bash -lc ${shellQuote(wrapped)} > ${shellQuote(`${basePath}.out`)} 2> ${shellQuote(`${basePath}.err`)} < /dev/null &`,
 +    'echo started',
 +  ].join('\n');
 +}
 +
-+interface ParsedOutput {
-+  stdout: string;
-+  stderr: string;
-+  exitCode: number | null;
-+}
-+
-+function parseMarkedOutput(raw: string): ParsedOutput {
-+  const markerIndex = raw.lastIndexOf(EXIT_SENTINEL);
-+
-+  if (markerIndex === -1) {
-+    return { stdout: raw, stderr: '', exitCode: null };
-+  }
-+
-+  const exitMatch = raw
-+    .slice(markerIndex + EXIT_SENTINEL.length)
-+    .match(/^(\d+)/);
-+
-+  return {
-+    stdout: raw.slice(0, markerIndex).replace(/\n+$/, ''),
-+    stderr: '',
-+    exitCode: exitMatch ? Number(exitMatch[1]) : null,
-+  };
-+}
-+
-+function emitParsed(
-+  parsed: ParsedOutput,
++function emitDetachedOutput(
++  output: { stdout: string; stderr: string },
 +  onOutput?: (event: CommandOutputEvent) => void,
 +): void {
 +  if (!onOutput) return;
 +
-+  if (parsed.stdout) onOutput({ stream: 'stdout', data: parsed.stdout });
++  if (output.stdout) onOutput({ stream: 'stdout', data: output.stdout });
++  if (output.stderr) onOutput({ stream: 'stderr', data: output.stderr });
 +}
 +
 +function parseLizardCommandId(commandId: string): string {
 +  if (!commandId.startsWith(LIZARD_COMMAND_ID_PREFIX)) {
 +    throw new Error(
-+      `Invalid Lizard command ID "${commandId}"; expected "${LIZARD_COMMAND_ID_PREFIX}<logPath>"`,
++      `Invalid Lizard command ID "${commandId}"; expected "${LIZARD_COMMAND_ID_PREFIX}<basePath>"`,
 +    );
 +  }
 +
@@ -636,7 +718,7 @@ index 0000000..a7c03e8
 +    .slice(0, 24);
 +  const suffix = randomUUID().replace(/-/g, '').slice(0, 12);
 +
-+  return `roomote-snap-${sanitized}-${suffix}`;
++  return `${LIZARD_SNAPSHOT_NAME_PREFIX}${sanitized}-${suffix}`;
 +}
 +
 +function isNotFound(error: unknown): boolean {
@@ -669,3 +751,49 @@ index 39072c9..97713d3 100644
 +export * from './adapters/lizard';
  export * from './adapters/azure';
  export * from './azure';
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index da03be1..2e9921e 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -1303,6 +1303,9 @@ importers:
+       '@daytonaio/sdk':
+         specifier: ^0.190.1
+         version: 0.190.1(ws@8.22.0(bufferutil@4.1.0)(utf-8-validate@6.0.6))
++      '@lizard-build/sdk':
++        specifier: 1.0.22
++        version: 1.0.22
+       '@roomote/env':
+         specifier: workspace:^
+         version: link:../env
+@@ -3169,6 +3172,10 @@ packages:
+     resolution: {integrity: sha512-V3MMIcV3PkEoD/ZEjuPCQVk6dnmg7qHVTYsLLtuV32rRPkvpC3YEIhJ5K8RseOcJnuuQJlVTvuLPBu6e1gC+7w==}
+     engines: {node: '>=18.x'}
+ 
++  '@lizard-build/sdk@1.0.22':
++    resolution: {integrity: sha512-HvL5a0X15sJWkk9oYFGM3+p7veaUUkV3bwDMmLRXu2cPPQwKvYcVm/ybLukdud1YKA8tE1TUyMAcMPcJZQlhlQ==}
++    engines: {node: '>=18'}
++
+   '@lukeed/ms@2.0.2':
+     resolution: {integrity: sha512-9I2Zn6+NJLfaGoz9jN3lpwDgAYvfGeNYdbAIjJOqzs4Tpc+VU3Jqq4IofSUBKajiDS8k9fZIg18/z13mpk1bsA==}
+     engines: {node: '>=8'}
+@@ -14156,6 +14163,8 @@ snapshots:
+       '@graphql-typed-document-node/core': 3.2.0(graphql@15.10.1)
+       graphql: 15.10.1
+ 
++  '@lizard-build/sdk@1.0.22': {}
++
+   '@lukeed/ms@2.0.2': {}
+ 
+   '@manypkg/find-root@1.1.0':
+diff --git a/pnpm-workspace.yaml b/pnpm-workspace.yaml
+index 365b603..dc5a256 100644
+--- a/pnpm-workspace.yaml
++++ b/pnpm-workspace.yaml
+@@ -10,4 +10,7 @@ minimumReleaseAgeExclude:
+   - jose
+   # Allow the patched releases while they finish maturing.
+   - brace-expansion
++  # Lizard SDK 1.0.22 is the first release with the sandbox API this adapter
++  # targets; pinned exactly and reviewed before adoption.
++  - "@lizard-build/sdk"
+ blockExoticSubdeps: true

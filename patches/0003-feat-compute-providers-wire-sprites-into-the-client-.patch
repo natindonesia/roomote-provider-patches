@@ -1,7 +1,7 @@
 From c2d22284f77dbe9be1af5c1fc6edd2e6e539c6b8 Mon Sep 17 00:00:00 2001
 From: Ticlext-Altihaf <hi@ticlext.top>
 Date: Thu, 19 Nov 2026 03:25:28 +0100
-Subject: [PATCH 3/6] feat(compute-providers): wire sprites into the client
+Subject: [PATCH 3/7] feat(compute-providers): wire sprites into the client
  factory
 
 Reads SPRITE_TOKEN plus optional SPRITES_API_BASE_URL, SPRITES_ORGANIZATION,

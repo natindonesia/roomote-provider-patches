@@ -1,7 +1,7 @@
-From c3fd3281c9545d7cd35334eb3f1ba9b3c56184fa Mon Sep 17 00:00:00 2001
+From af2442596583c9ddb2e2f441a4c5771a293e5e33 Mon Sep 17 00:00:00 2001
 From: Ticlext-Altihaf <hi@ticlext.top>
 Date: Thu, 19 Nov 2026 03:28:06 +0100
-Subject: [PATCH 6/6] feat(compute-providers): wire lizard into the client
+Subject: [PATCH 6/7] feat(compute-providers): wire lizard into the client
  factory
 
 Reads LIZARD_API_KEY and LIZARD_PROJECT plus optional LIZARD_API_URL,

@@ -1,0 +1,1575 @@
+From 942fb6de971a253cbeab96a889101ea83b739d84 Mon Sep 17 00:00:00 2001
+From: Ticlext-Altihaf <hi@ticlext.top>
+Date: Thu, 19 Nov 2026 04:01:43 +0100
+Subject: [PATCH 7/7] feat(compute-providers): bootstrap the Lizard worker and
+ expose Lizard in setup
+
+Install the Roomote worker into fresh and forked Lizard microVMs, dispatch
+task runs to them from the controller, and surface Lizard in the settings,
+onboarding, and docs surfaces.
+
+Lizard ships no custom-template upload flow, so the worker is installed at
+boot: the release archive and the shipped install script are uploaded through
+the filesystem API and executed once the sandbox is running. Snapshot forks
+reinstall the worker so the sandbox matches the current runtime protocol;
+standby resumes reuse the existing install.
+---
+ apps/bullmq/src/scheduled-jobs/sleep-check.ts |   2 +
+ .../src/scheduled-jobs/standby-retention.ts   |  24 +-
+ apps/controller/src/RoomoteController.ts      |  60 ++-
+ .../controller/src/compute-providers/index.ts |   1 +
+ .../compute-providers/spawn-lizard-worker.ts  | 372 ++++++++++++++++++
+ apps/docs/compute.mdx                         |   1 +
+ apps/docs/docs.json                           |   1 +
+ apps/docs/logo/integrations/lizard.svg        |   3 +
+ apps/docs/providers/compute/lizard.mdx        | 127 ++++++
+ .../(onboarding)/setup/computeSetupCopy.ts    |   8 +
+ .../setup/SandboxProviderPicker.tsx           |   2 +
+ .../[taskId]/sidebar-panels/TaskInfoPanel.tsx |   4 +
+ .../settings/ComputeProviderSection.tsx       |   2 +
+ .../system/custom/logos/brand-icon.tsx        |  43 ++
+ packages/compute-providers/src/index.ts       |   1 +
+ .../src/lizard/create-lizard-machine.ts       | 302 ++++++++++++++
+ .../compute-providers/src/lizard/index.ts     |   1 +
+ .../compute-providers/src/worker-env/index.ts |   1 +
+ .../src/worker-env/lizard.ts                  |  33 ++
+ packages/db/src/schema.ts                     |  10 +-
+ packages/env/src/index.ts                     |  18 +
+ .../record-compute-provider-usage.ts          |  34 ++
+ packages/types/src/compute-provider-usage.ts  |   2 +
+ packages/types/src/setup-compute-config.ts    | 150 +++++++
+ 24 files changed, 1194 insertions(+), 8 deletions(-)
+ create mode 100644 apps/controller/src/compute-providers/spawn-lizard-worker.ts
+ create mode 100644 apps/docs/logo/integrations/lizard.svg
+ create mode 100644 apps/docs/providers/compute/lizard.mdx
+ create mode 100644 packages/compute-providers/src/lizard/create-lizard-machine.ts
+ create mode 100644 packages/compute-providers/src/lizard/index.ts
+ create mode 100644 packages/compute-providers/src/worker-env/lizard.ts
+
+diff --git a/apps/bullmq/src/scheduled-jobs/sleep-check.ts b/apps/bullmq/src/scheduled-jobs/sleep-check.ts
+index 3cac397..61a528c 100644
+--- a/apps/bullmq/src/scheduled-jobs/sleep-check.ts
++++ b/apps/bullmq/src/scheduled-jobs/sleep-check.ts
+@@ -202,6 +202,8 @@ function buildSleepCheckClient(
+       return createComputeProviderClient({ provider: 'blaxel', envFallback });
+     case 'box':
+       return createComputeProviderClient({ provider: 'box', envFallback });
++    case 'lizard':
++      return createComputeProviderClient({ provider: 'lizard', envFallback });
+     case 'azure':
+       return createComputeProviderClient({ provider: 'azure', envFallback });
+     case 'docker':
+diff --git a/apps/bullmq/src/scheduled-jobs/standby-retention.ts b/apps/bullmq/src/scheduled-jobs/standby-retention.ts
+index 1db854a..56efc42 100644
+--- a/apps/bullmq/src/scheduled-jobs/standby-retention.ts
++++ b/apps/bullmq/src/scheduled-jobs/standby-retention.ts
+@@ -14,11 +14,21 @@ import { activeRunStatuses, type RunStatus } from '@roomote/types';
+ 
+ const LOG_PREFIX = '[standbyRetention]';
+ const MS_PER_HOUR = 60 * 60 * 1_000;
+-const STANDBY_PROVIDERS = ['docker', 'blaxel', 'box', 'azure'] as const;
++const STANDBY_PROVIDERS = [
++  'docker',
++  'blaxel',
++  'box',
++  'lizard',
++  'azure',
++] as const;
+ 
+ // Providers whose retained handles are live instances that can (and must) be
+ // re-suspended when found Running with no managing run.
+-const RE_SUSPEND_PROVIDERS: readonly StandbyProvider[] = ['box', 'azure'];
++const RE_SUSPEND_PROVIDERS: readonly StandbyProvider[] = [
++  'box',
++  'lizard',
++  'azure',
++];
+ 
+ type StandbyProvider = (typeof STANDBY_PROVIDERS)[number];
+ 
+@@ -48,6 +58,9 @@ const DEFAULT_POLICY = {
+   docker: { maxCount: 10, maxAgeHours: 24 },
+   blaxel: { maxCount: 25, maxAgeHours: 168 },
+   box: { maxCount: 25, maxAgeHours: 168 },
++  // Paused Lizard sandboxes bill $0.14/GB-month of used disk, so keep the
++  // retained set small.
++  lizard: { maxCount: 10, maxAgeHours: 168 },
+   // Suspended ACA sandboxes cost almost nothing, so azure retention is generous.
+   azure: { maxCount: 50, maxAgeHours: 720 },
+ } as const;
+@@ -109,6 +122,13 @@ async function createClient(provider: StandbyProvider) {
+     });
+   }
+ 
++  if (provider === 'lizard') {
++    return createComputeProviderClient({
++      provider: 'lizard',
++      envFallback: await resolveComputeProviderEnvValues('lizard'),
++    });
++  }
++
+   return createComputeProviderClient({
+     provider: 'blaxel',
+     envFallback: await resolveComputeProviderEnvValues('blaxel'),
+diff --git a/apps/controller/src/RoomoteController.ts b/apps/controller/src/RoomoteController.ts
+index f846a7d..162563e 100644
+--- a/apps/controller/src/RoomoteController.ts
++++ b/apps/controller/src/RoomoteController.ts
+@@ -14,7 +14,10 @@ import {
+   resolveComputeProviderEnvValues,
+ } from '@roomote/db/server';
+ 
+-import { DEFAULT_BOX_TIMEOUT_MS } from '@roomote/compute-providers';
++import {
++  DEFAULT_BOX_TIMEOUT_MS,
++  DEFAULT_LIZARD_TIMEOUT_MS,
++} from '@roomote/compute-providers';
+ 
+ import { BaseController } from './BaseController';
+ import {
+@@ -29,6 +32,7 @@ import {
+   spawnE2bWorker,
+   spawnBlaxelWorker,
+   spawnBoxWorker,
++  spawnLizardWorker,
+   spawnAzureWorker,
+   spawnModalWorker,
+ } from './compute-providers';
+@@ -377,6 +381,39 @@ export class RoomoteController extends BaseController {
+         });
+         return;
+       }
++      case 'lizard': {
++        const lizardApiKey = resolvedEnv.LIZARD_API_KEY;
++        const lizardProject = resolvedEnv.LIZARD_PROJECT;
++
++        if (!lizardApiKey) {
++          throw new Error('LIZARD_API_KEY is required to spawn Lizard workers');
++        }
++
++        if (!lizardProject) {
++          throw new Error('LIZARD_PROJECT is required to spawn Lizard workers');
++        }
++
++        const configuredTimeoutMs = Number(resolvedEnv.LIZARD_TIMEOUT_MS);
++        const lizardTimeoutMs = Math.min(
++          timeoutMs,
++          Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
++            ? configuredTimeoutMs
++            : DEFAULT_LIZARD_TIMEOUT_MS,
++        );
++
++        await spawnLizardWorker(taskRun, authToken, {
++          credentialEgress: this.credentialEgress,
++          deploymentSlug,
++          apiKey: lizardApiKey,
++          project: lizardProject,
++          apiUrl: resolvedEnv.LIZARD_API_URL,
++          template: resolvedEnv.LIZARD_TEMPLATE,
++          size: parseLizardSize(resolvedEnv.LIZARD_SIZE),
++          timeoutMs: lizardTimeoutMs,
++          localTarballPath: this.localWorkerReleasePath,
++        });
++        return;
++      }
+       case 'azure': {
+         const azureSubscriptionId = resolvedEnv.AZURE_SUBSCRIPTION_ID;
+         const azureResourceGroup = resolvedEnv.AZURE_RESOURCE_GROUP;
+@@ -432,6 +469,14 @@ export class RoomoteController extends BaseController {
+         });
+         return;
+       }
++      case 'sprites': {
++        // The Sprites client is implemented and registered, but its worker
++        // bootstrap (create-sprites-machine.ts) is not. Fail loudly instead of
++        // silently falling through to another provider.
++        throw new Error(
++          'Sprites worker bootstrap is not implemented in this integration; use Lizard or complete create-sprites-machine.ts',
++        );
++      }
+       default: {
+         const _exhaustive: never = provider;
+         throw new Error(`Unsupported compute provider: ${_exhaustive}`);
+@@ -475,3 +520,16 @@ export class RoomoteController extends BaseController {
+     }
+   }
+ }
++
++function parseLizardSize(
++  value: string | undefined,
++): 'nano' | 'mini' | 'small' | 'medium' | 'large' | 'big' | undefined {
++  return value === 'nano' ||
++    value === 'mini' ||
++    value === 'small' ||
++    value === 'medium' ||
++    value === 'large' ||
++    value === 'big'
++    ? value
++    : undefined;
++}
+diff --git a/apps/controller/src/compute-providers/index.ts b/apps/controller/src/compute-providers/index.ts
+index b6e2ce5..c67d23e 100644
+--- a/apps/controller/src/compute-providers/index.ts
++++ b/apps/controller/src/compute-providers/index.ts
+@@ -8,4 +8,5 @@ export { spawnDaytonaWorker } from './spawn-daytona-worker';
+ export { spawnE2bWorker } from './spawn-e2b-worker';
+ export { spawnBlaxelWorker } from './spawn-blaxel-worker';
+ export { spawnBoxWorker } from './spawn-box-worker';
++export { spawnLizardWorker } from './spawn-lizard-worker';
+ export { spawnAzureWorker } from './spawn-azure-worker';
+diff --git a/apps/controller/src/compute-providers/spawn-lizard-worker.ts b/apps/controller/src/compute-providers/spawn-lizard-worker.ts
+new file mode 100644
+index 0000000..6921094
+--- /dev/null
++++ b/apps/controller/src/compute-providers/spawn-lizard-worker.ts
+@@ -0,0 +1,372 @@
++import {
++  NonRetryableSpawnError,
++  TaskPayloadKind,
++  getPrimaryPortFromConfig,
++} from '@roomote/types';
++import {
++  type TaskRun,
++  createComputeProviderMutationEventRecorder,
++  db,
++} from '@roomote/db/server';
++import { stampTaskRunMilestone } from '@roomote/sdk/server';
++import {
++  LIZARD_SIZE_MEMORY_MIB,
++  buildComputeProviderMutationDetails,
++  buildLizardWorkerEnv,
++  createComputeProviderClient,
++  createLizardMachine,
++  resolveAuthBypassHeaderName,
++  resolveAuthBypassValue,
++} from '@roomote/compute-providers';
++
++import { primeEnvironmentOidcForMachine } from '../sandbox-oidc';
++import {
++  getNamedPortsForTaskRun,
++  shouldEnableAuthBypassForTaskRun,
++  updateTaskRunMachine,
++} from '../utils';
++import {
++  prepareHostedWorkerLaunch,
++  type CredentialEgressLifecycle,
++} from '../credential-egress';
++import { resolveTaskSandboxMemoryMiB } from './task-sandbox-resources';
++import { COMPUTE_BOOTSTRAP_TIMEOUT_MS } from './timeouts';
++
++type LizardSize = keyof typeof LIZARD_SIZE_MEMORY_MIB;
++
++const LIZARD_SIZE_ORDER: readonly LizardSize[] = [
++  'nano',
++  'mini',
++  'small',
++  'medium',
++  'large',
++  'big',
++];
++
++/**
++ * Pick the smallest Lizard size that satisfies the task's memory requirement,
++ * never smaller than the configured size. Sizes are billed per second while
++ * running, so overshooting the requirement costs real money.
++ */
++export function resolveLizardSize(
++  requiredMemoryMiB: number,
++  configuredSize?: LizardSize,
++): LizardSize {
++  const configuredMemoryMiB = configuredSize
++    ? LIZARD_SIZE_MEMORY_MIB[configuredSize]
++    : 0;
++  const needed = Math.max(requiredMemoryMiB, configuredMemoryMiB);
++
++  for (const size of LIZARD_SIZE_ORDER) {
++    if (LIZARD_SIZE_MEMORY_MIB[size] >= needed) {
++      return size;
++    }
++  }
++
++  throw new NonRetryableSpawnError(
++    `Lizard supports at most ${LIZARD_SIZE_MEMORY_MIB.big} MiB of memory; the task requested ${needed} MiB`,
++  );
++}
++
++function getWorkerLaunchCommand(
++  taskRun: TaskRun,
++): 'snapshot' | 'resume' | 'run' {
++  switch (taskRun.payloadKind) {
++    case TaskPayloadKind.SnapshotEnvironment:
++      return 'snapshot';
++    case TaskPayloadKind.SnapshotResume:
++      return 'resume';
++    default:
++      return 'run';
++  }
++}
++
++function getWorkerLaunchArgs(taskRun: TaskRun, machineId: string): string[] {
++  const command = getWorkerLaunchCommand(taskRun);
++
++  if (taskRun.payloadKind === TaskPayloadKind.SnapshotEnvironment) {
++    return [
++      'snapshot',
++      '--task-run-id',
++      taskRun.id.toString(),
++      '--environment-id',
++      taskRun.payload.environmentId ?? '',
++      '--sandbox-id',
++      machineId,
++    ];
++  }
++
++  return [command, taskRun.id.toString()];
++}
++
++export async function spawnLizardWorker(
++  taskRun: TaskRun,
++  authToken: string,
++  config: {
++    apiKey: string;
++    project: string;
++    apiUrl?: string;
++    template?: string;
++    size?: LizardSize;
++    timeoutMs: number;
++    localTarballPath?: string;
++    deploymentSlug?: string;
++    /** Session-egress admission; omitted in unit paths that do not exercise it. */
++    credentialEgress?: CredentialEgressLifecycle;
++  },
++): Promise<{ machineId: string; sandboxCmdId?: string }> {
++  const { namedPorts, environmentSnapshotId, environmentConfig } =
++    await getNamedPortsForTaskRun(taskRun);
++
++  let launchOptions:
++    | { launchMode: 'fresh' }
++    | { launchMode: 'environment_snapshot'; sourceSnapshotId: string }
++    | { launchMode: 'task_snapshot'; sourceSnapshotId: string }
++    | { launchMode: 'task_standby'; resumeHandle: string };
++
++  if (taskRun.payloadKind === TaskPayloadKind.SnapshotResume) {
++    const snapshotId = taskRun.sourceSnapshotId;
++    if (!snapshotId) {
++      throw new NonRetryableSpawnError(
++        `SnapshotResume task run ${taskRun.id} has no sourceSnapshotId`,
++      );
++    }
++
++    // A Lizard sandbox id is a standby handle; a snapshot id is a template to
++    // fork. Snapshot ids carry the roomote-snap- prefix this adapter mints.
++    launchOptions = snapshotId.startsWith('roomote-snap-')
++      ? { launchMode: 'task_snapshot', sourceSnapshotId: snapshotId }
++      : { launchMode: 'task_standby', resumeHandle: snapshotId };
++  } else if (taskRun.payloadKind === TaskPayloadKind.SnapshotEnvironment) {
++    launchOptions = { launchMode: 'fresh' };
++  } else {
++    const snapshotId =
++      taskRun.sourceSnapshotId ?? environmentSnapshotId ?? undefined;
++    launchOptions = snapshotId
++      ? { launchMode: 'environment_snapshot', sourceSnapshotId: snapshotId }
++      : { launchMode: 'fresh' };
++  }
++
++  if (
++    taskRun.payloadKind === TaskPayloadKind.SnapshotEnvironment &&
++    !taskRun.payload.environmentId
++  ) {
++    throw new NonRetryableSpawnError(
++      `SnapshotEnvironment task run ${taskRun.id} has no environmentId`,
++    );
++  }
++
++  const sandboxResources = await resolveTaskSandboxMemoryMiB(
++    taskRun,
++    environmentConfig,
++  );
++
++  // Lizard's catalog templates have no Docker daemon; nested-Docker projects
++  // fail at container start with a confusing error. Fail at spawn instead.
++  if (sandboxResources.needsNestedDocker) {
++    throw new NonRetryableSpawnError(
++      'Lizard sandboxes cannot run nested Docker projects; choose a provider with Docker support',
++    );
++  }
++
++  const size = resolveLizardSize(sandboxResources.memoryMiB, config.size);
++
++  const authBypassEnabled = shouldEnableAuthBypassForTaskRun({
++    environmentConfig,
++    namedPorts,
++  });
++  const authBypassValue = authBypassEnabled
++    ? resolveAuthBypassValue(environmentConfig)
++    : undefined;
++  const authBypassHeaderName = authBypassEnabled
++    ? resolveAuthBypassHeaderName(environmentConfig)
++    : undefined;
++
++  const environmentId = taskRun.payload.environmentId;
++  const mutationContext = {
++    launchMode: launchOptions.launchMode,
++    sourceSnapshotId:
++      'resumeHandle' in launchOptions
++        ? launchOptions.resumeHandle
++        : 'sourceSnapshotId' in launchOptions
++          ? launchOptions.sourceSnapshotId
++          : null,
++    ports: namedPorts.map(({ port }) => port),
++  };
++  const recordMutation = createComputeProviderMutationEventRecorder(
++    db,
++    { runId: taskRun.id, taskId: taskRun.taskId },
++    { logPrefix: 'spawnLizardWorker', logger: console },
++  );
++
++  const computeClient = createComputeProviderClient({
++    provider: 'lizard',
++    config: {
++      apiKey: config.apiKey,
++      project: config.project,
++      ...(config.apiUrl ? { apiUrl: config.apiUrl } : {}),
++      ...(config.template ? { template: config.template } : {}),
++      size,
++      timeoutMs: config.timeoutMs,
++    },
++  });
++
++  await stampTaskRunMilestone({
++    runId: taskRun.id,
++    field: 'provisionStartedAt',
++    launchMode: launchOptions.launchMode,
++  });
++
++  const launchHostedWorker = await prepareHostedWorkerLaunch({
++    credentialEgress: config.credentialEgress,
++    taskRun,
++    provider: 'lizard',
++  });
++
++  const machine = await createLizardMachine({
++    apiKey: config.apiKey,
++    project: config.project,
++    ...(config.apiUrl ? { apiUrl: config.apiUrl } : {}),
++    ...(config.template ? { template: config.template } : {}),
++    size,
++    timeoutMs: config.timeoutMs,
++    idempotencyKey: `roomote-task-${taskRun.taskId}`,
++    namedPorts,
++    localTarballPath: config.localTarballPath,
++    bootstrapTimeoutMs: COMPUTE_BOOTSTRAP_TIMEOUT_MS,
++    computeClient,
++    onMutation: recordMutation,
++    ...launchOptions,
++  });
++
++  let launchedCommandId: string | undefined;
++
++  try {
++    await updateTaskRunMachine({
++      taskRun,
++      vendor: 'lizard',
++      machineId: machine.machineId,
++      namedPorts,
++      domainFn: machine.domain,
++      proxyPorts: machine.proxyPorts,
++      explicitPrimaryPortName: getPrimaryPortFromConfig(
++        environmentConfig?.ports,
++      )?.name,
++      sourceSnapshotId: machine.sourceSnapshotId ?? null,
++      authBypassValue,
++      authBypassHeaderName,
++      configuredMemoryMiB: LIZARD_SIZE_MEMORY_MIB[size],
++    });
++
++    await stampTaskRunMilestone({
++      runId: taskRun.id,
++      field: 'provisionReadyAt',
++    });
++
++    if (environmentId && environmentConfig) {
++      await primeEnvironmentOidcForMachine({
++        taskId: taskRun.taskId,
++        environmentId,
++        environmentConfig,
++        computeProvider: 'lizard',
++        computeProviderId: machine.machineId,
++        runId: taskRun.id,
++        context:
++          launchOptions.launchMode === 'task_standby'
++            ? 'Standby-resumed Lizard launch'
++            : launchOptions.launchMode === 'environment_snapshot' ||
++                launchOptions.launchMode === 'task_snapshot'
++              ? 'Template-forked Lizard launch'
++              : 'Fresh Lizard launch',
++      });
++    }
++
++    const args = getWorkerLaunchArgs(taskRun, machine.machineId);
++
++    await recordMutation({
++      provider: 'lizard',
++      operation: 'run_command',
++      eventType: 'started',
++      instanceId: machine.machineId,
++      message: `Launching detached worker for Lizard sandbox ${machine.machineId}`,
++      details: buildComputeProviderMutationDetails(mutationContext, {
++        command: 'worker',
++        args,
++        detached: true,
++        phase: 'launch_worker',
++      }),
++    });
++
++    const result = await launchHostedWorker(
++      buildLizardWorkerEnv({
++        authToken,
++        sandboxExpiresAtMs: Date.now() + config.timeoutMs,
++        deploymentSlug: config.deploymentSlug,
++        environmentId,
++        size,
++        extraEnv: {
++          SANDBOX_TIMEOUT_MS: String(config.timeoutMs),
++        },
++      }),
++      async (env) => {
++        const launchResult = await computeClient.runCommand({
++          instanceId: machine.machineId,
++          cmd: 'worker',
++          args,
++          env,
++          detached: true,
++          signal: AbortSignal.timeout(60_000),
++        });
++
++        launchedCommandId = launchResult.commandId;
++
++        if (launchResult.exitCode !== null && launchResult.exitCode !== 0) {
++          throw new Error(
++            `Detached Lizard worker exited with code ${launchResult.exitCode}`,
++          );
++        }
++
++        await recordMutation({
++          provider: 'lizard',
++          operation: 'run_command',
++          eventType: 'completed',
++          instanceId: machine.machineId,
++          message: `Detached worker launched for Lizard sandbox ${machine.machineId}`,
++          details: buildComputeProviderMutationDetails(mutationContext, {
++            commandId: launchResult.commandId ?? null,
++            exitCode: launchResult.exitCode,
++          }),
++        });
++
++        return launchResult;
++      },
++    );
++
++    return {
++      machineId: machine.machineId,
++      ...(result.commandId ? { sandboxCmdId: result.commandId } : {}),
++    };
++  } catch (error) {
++    if (launchOptions.launchMode === 'task_standby') {
++      await computeClient
++        .enterStandby?.({
++          instanceId: machine.machineId,
++          commandId: launchedCommandId,
++        })
++        .catch((cleanupError) => {
++          console.error(
++            '[spawnLizardWorker] Failed to restore standby after resume failure',
++            cleanupError,
++          );
++        });
++    } else {
++      await computeClient
++        .destroyInstance({ instanceId: machine.machineId })
++        .catch((cleanupError) => {
++          console.error('[spawnLizardWorker] Cleanup failed', cleanupError);
++        });
++    }
++
++    throw error;
++  }
++}
+diff --git a/apps/docs/compute.mdx b/apps/docs/compute.mdx
+index 896f148..f819c05 100644
+--- a/apps/docs/compute.mdx
++++ b/apps/docs/compute.mdx
+@@ -45,6 +45,7 @@ Roomote supports local and hosted sandbox backends:
+ | <IntegrationName href="/providers/compute/daytona" icon="daytona" name="Daytona" /> | Hosted task sandboxes with snapshot support            | Supports environment and task-level snapshot flows.                     |
+ | <IntegrationName href="/providers/compute/blaxel" icon="blaxel" name="Blaxel" />    | Hosted perpetual task sandboxes                        | Uses automatic standby for resumable tasks.                             |
+ | <IntegrationName href="/providers/compute/box" icon="box" name="Box" />             | Hosted task sandboxes                                  | API-key setup, Docker projects, private previews, and same-sandbox task resume. |
++| <IntegrationName href="/providers/compute/lizard" icon="lizard" name="Lizard" />    | Hosted microVM task sandboxes                          | Fast boots, per-port previews, snapshots, and standby resume. No Docker projects. |
+ | <IntegrationName href="/providers/compute/azure" icon="azure" name="Azure" />      | Hosted task sandboxes on Azure Container Apps (preview) | Supports memory+disk snapshots and sub-second standby resume.           |
+ 
+ Docker is the default because it works well for local development and simple
+diff --git a/apps/docs/docs.json b/apps/docs/docs.json
+index 232c3b5..9050124 100644
+--- a/apps/docs/docs.json
++++ b/apps/docs/docs.json
+@@ -163,6 +163,7 @@
+               "providers/compute/daytona",
+               "providers/compute/docker",
+               "providers/compute/e2b",
++              "providers/compute/lizard",
+               "providers/compute/modal"
+             ]
+           }
+diff --git a/apps/docs/logo/integrations/lizard.svg b/apps/docs/logo/integrations/lizard.svg
+new file mode 100644
+index 0000000..65ccbb6
+--- /dev/null
++++ b/apps/docs/logo/integrations/lizard.svg
+@@ -0,0 +1,3 @@
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="5 4 90 92">
++  <path fill="currentColor" d="M78.115,19.738c1.451-0.486,3.18-0.973,5.911-3.152c2.734-2.176,5.204-6.027,5.757-7.176 c0.552-1.147,1.226-2.145,0.893-2.642c-0.337-0.493-1.796-0.631-3.059-0.114c-1.26,0.516-4.505,1.152-5.735,1.739 c-1.234,0.59-2.403,1.18-3.317,2.161c-0.915,0.985-2.536,4.41-4.401,5.024c-1.864,0.612-3.314,1.198-4.153,0.787 c-0.837-0.415-1.372-0.813-0.818-1.277c0.555-0.463,1.488-1.563,1.998-1.517c0.506,0.047,0.995,0.237,1.472,0.592 c0.476,0.356,1.04,0.895,1.356,0.51c0.315-0.388-0.623-0.72-1.024-0.934c-0.4-0.214-0.19-0.877,0.127-0.922 c0.313-0.042,3.799-0.121,3.678-0.842c-0.12-0.724-3.362,0.317-3.416-0.08c-0.051-0.4,0.254-1.037,1.184-1.575 c0.932-0.543,3.102-1.62,2.982-2.173c-0.122-0.555-2.69,1.635-3.476,2.166c-0.785,0.53-1.293,0.685-1.578,0.494 c-0.285-0.19,0.193-2.026,0.748-2.77c0.555-0.743,1.802-2.558,1.083-2.615c-0.719-0.063-1.28,2.123-1.682,3.105 c-0.398,0.983-1.314,2.79-1.707,2.457c-0.393-0.336-0.662-3.534-1.443-3.115c-0.782,0.421,0.937,1.87,0.624,3.238 c-0.312,1.369-0.347,1.584-0.837,1.873c-0.49,0.292-1.772,0.859-2.281,1.496c-0.509,0.641-0.575,1.606-0.098,2.059 c0.479,0.449,0.779,0.675,0.436,0.786c-0.344,0.11-6.629,0.721-10.204,1.403c-1.304,0.249-8.559,2.154-8.81,1.781 c-0.253-0.372,1.38-3.801,1.36-4.626c-0.02-0.826-0.641-1.204-1.425-1.326c-0.784-0.125-2.396-0.788-2.354-1.028 c0.035-0.237-0.09-0.622,0.725-0.925c0.815-0.308,4.295-1.545,3.936-2.244c-0.355-0.701-4.486,2.272-4.614,2.144 c-0.126-0.128,3.173-5.74,2.083-5.956c-1.092-0.217-2.646,6.117-2.977,5.874c-0.335-0.246-0.439-7.29-1.529-7.041 c-1.095,0.252,1.112,6.621,0.58,6.611c-0.531-0.01-2.238-3.329-2.764-2.893c-0.527,0.437,2.814,3.452,2.63,3.856 c-0.188,0.405-1.173,0.935-0.481,1.412c0.692,0.48,2.896,1.787,2.699,2.374c-0.197,0.587-1.34,1.606-1.871,3.135 c-0.533,1.531-0.558,3.014-0.988,3.144c-0.432,0.131-12.346,6.088-17.82,11.99c-6.477,6.979-11.541,18.665-10.131,30.234 c1.058,8.675,4.525,20.307,13.588,28.774c0,0,2.07,1.551,0.086-0.725c-2.09-2.395-6.535-8.131-9.683-20.572 c-3.226-12.749,1.267-23.968,5.17-28.82c5.044-6.27,13.273-12.174,18.075-13.883c3.229-1.15,3.06-1.592,3.481-1.498 c0.421,0.101,4.8,0.833,4.699,1.254c-0.101,0.423-1.295,4.59-0.821,5.086c0.475,0.496,4.383,1.949,4.383,1.949 s1.791,3.753,2.304,3.497c0.513-0.259-1.475-3.47-1.259-3.487c0.219-0.018,4.699,1.974,5.547,2.011 c0.846,0.033,0.968-1.003,0.389-1.316c-0.582-0.31-5.645-1.03-5.62-1.18c0.022-0.156,6.432-1.061,5.898-2.355 c-0.529-1.292-6.186,1.756-6.314,1.58c-0.131-0.175,3.575-3.549,2.825-4.056c-0.75-0.502-2.943,4.002-3.096,3.725 c-0.151-0.281,1.033-4.778,0.13-4.794c-0.903-0.013-0.523,4.38-0.988,4.427c-0.464,0.042-1.899-1.006-1.616-1.879 c0.281-0.874,1.59-3.289,1.584-3.944c-0.002-0.657-0.063-1.24,0.448-1.24c0.515,0,5.939,0.278,9.31-0.262 c3.372-0.544,7.811-2.348,8.37-2.092c0.561,0.253,1.327,1.732,1.926,2.329c0.597,0.599,2.671,1.028,3.434,1.127 c0.764,0.098,1.085,0.417,1.288,0.556c0.201,0.139,1.271,1.542,1.399,1.942c0.129,0.403-0.033,1.343,0.594,1.502 c0.626,0.158,1.268-0.637,0.573-1.267c-0.692-0.623-1.328-1.349-1.293-1.628c0.034-0.278,0.297-0.719,1.09-0.375 c0.79,0.344,4.606,2.859,5.049,2.053c0.444-0.809-5.119-2.006-5.112-2.33c0.009-0.324-0.069-0.871,1.033-0.836 c1.104,0.035,5.334,0.174,5.063-0.496c-0.271-0.667-5.114,0.269-5.277-0.255c-0.166-0.528,3.11-1.85,2.483-2.555 c-0.628-0.705-2.738,1.848-3.375,1.775c-0.636-0.071-0.962-0.857-0.883-1.303s0.377-0.932,0.058-1.187 c-0.318-0.256-0.797,0.042-0.729,0.476c0.067,0.436,0.082,1.842-0.346,1.955c-0.427,0.119-3.066-0.164-3.421-0.855 c-0.354-0.689-0.717-2.457-0.464-3.183C75.612,22.162,76.662,20.23,78.115,19.738z M64.022,18.998c0.266,0,0.479,0.215,0.479,0.481 c0,0.265-0.214,0.48-0.479,0.48s-0.48-0.215-0.48-0.48C63.542,19.213,63.757,18.998,64.022,18.998z M55.022,20.998 c0.266,0,0.479,0.215,0.479,0.481c0,0.265-0.214,0.48-0.479,0.48s-0.48-0.215-0.48-0.48C54.542,21.213,54.757,20.998,55.022,20.998z M51.022,24.958c-0.266,0-0.48-0.215-0.48-0.48c0-0.266,0.215-0.481,0.48-0.481s0.479,0.215,0.479,0.481 C51.502,24.743,51.288,24.958,51.022,24.958z M60.022,23.958c-0.266,0-0.48-0.215-0.48-0.48c0-0.266,0.215-0.481,0.48-0.481 s0.479,0.215,0.479,0.481C60.502,23.743,60.288,23.958,60.022,23.958z M69.022,21.958c-0.266,0-0.48-0.215-0.48-0.48 c0-0.266,0.215-0.481,0.48-0.481s0.479,0.215,0.479,0.481C69.502,21.743,69.288,21.958,69.022,21.958z M73.933,18.79 c-0.072,0.049-0.152,0.107-0.238,0.169c-0.558,0.402-1.394,1.013-2.341,0.952c-0.341-0.021-0.708-0.089-1.064-0.155 c-0.647-0.119-1.319-0.242-1.849-0.098c-0.842,0.229-1.263,0.727-1.708,1.253c-0.475,0.562-0.966,1.142-1.958,1.413 c-1.068,0.292-2.188-0.145-3.175-0.53c-0.797-0.311-1.55-0.606-2.125-0.468c-0.574,0.135-0.941,0.545-1.367,1.02 c-0.534,0.597-1.141,1.273-2.297,1.563c-1.129,0.279-2.105-0.056-2.97-0.353c-0.738-0.253-1.434-0.494-2.11-0.314 c-0.63,0.166-1.082,0.559-1.562,0.976c-0.663,0.577-1.351,1.174-2.538,1.2c-0.363,0.01-0.689-0.003-0.99-0.014 c-1.136-0.038-1.826-0.062-2.787,1.013c-1.287,1.44-2.365,1.51-3.314,1.57c-0.576,0.037-1.074,0.069-1.556,0.414 c-0.409,0.293-0.678,0.614-0.962,0.953c-0.39,0.466-0.793,0.948-1.564,1.338c-0.338,0.17-0.73,0.269-1.146,0.373 c-0.775,0.194-1.654,0.414-2.558,1.169c-0.003,0.002-0.007,0.001-0.01,0.003s-0.002,0.006-0.005,0.008 c-0.122,0.088-12.286,8.943-14.576,23.129c-0.02,0.123-0.126,0.21-0.246,0.21c-0.013,0-0.026-0.001-0.04-0.003 c-0.137-0.022-0.229-0.069-0.207-0.206c2.323-14.396,14.653-23.295,14.654-23.296c1.395-1.142,2.084-1.223,2.866-1.419 c0.403-0.101,0.753-0.229,1.04-0.374c0.681-0.344,1.034-0.787,1.408-1.233c0.291-0.348,0.592-0.717,1.054-1.048 c0.599-0.429,1.216-0.474,1.813-0.512c0.896-0.058,1.824-0.12,2.975-1.407c1.117-1.25,1.979-1.222,3.178-1.181 c0.293,0.009,0.608,0.021,0.961,0.012c1.008-0.022,1.598-0.535,2.222-1.077c0.501-0.436,1.02-0.887,1.763-1.082 c0.82-0.215,1.589,0.046,2.399,0.325c0.837,0.288,1.701,0.585,2.687,0.34c1.008-0.252,1.535-0.841,2.046-1.411 c0.462-0.515,0.897-1.002,1.624-1.173c0.728-0.171,1.551,0.149,2.422,0.489c0.96,0.374,1.952,0.761,2.862,0.513 c0.842-0.229,1.263-0.727,1.708-1.253c0.475-0.562,0.966-1.142,1.958-1.413c0.64-0.173,1.366-0.04,2.07,0.089 c0.357,0.066,0.694,0.128,1.005,0.147c0.755,0.047,1.486-0.476,2.017-0.858c0.091-0.065,0.174-0.125,0.25-0.177 c0.113-0.078,0.27-0.048,0.347,0.065C74.076,18.557,74.047,18.712,73.933,18.79z"/>
++</svg>
+diff --git a/apps/docs/providers/compute/lizard.mdx b/apps/docs/providers/compute/lizard.mdx
+new file mode 100644
+index 0000000..ac37c2a
+--- /dev/null
++++ b/apps/docs/providers/compute/lizard.mdx
+@@ -0,0 +1,127 @@
++---
++title: Lizard
++icon: '/logo/integrations/lizard.svg'
++description: Run Roomote tasks in Lizard Firecracker microVM sandboxes.
++---
++
++Lizard is a hosted sandbox provider for running Roomote tasks away from the
++Roomote server. Each sandbox is a Firecracker microVM with its own kernel,
++billed per second while it runs.
++
++## When to use Lizard
++
++Use Lizard when:
++
++- task work should run on provider-managed microVMs with strong isolation
++- you want API-key-only setup without building a provider-side worker image
++  during Roomote setup
++- sandboxes should boot in well under a second from a catalog template
++- environments need per-port preview URLs
++- you want both environment snapshots and same-sandbox standby resume
++
++Lizard is the only provider in Roomote that supports snapshots **and** standby
++resume **and** per-port previews. It does not run Docker projects: the catalog
++templates have no Docker daemon.
++
++## Configuration
++
++Create an API key from the [Lizard dashboard](https://lizard.build/dashboard),
++then add Lizard from **Settings > Sandboxes**. Every sandbox must be billed to a
++project, so the project ID or slug is required too. You can also provide both as
++deployment env vars:
++
++```sh
++DEFAULT_COMPUTE_PROVIDER=lizard
++LIZARD_API_KEY=...
++LIZARD_PROJECT=...
++```
++
++Optional settings:
++
++```sh
++# Catalog template to boot. Defaults to interpreter, which ships Node 22 and
++# Python. base, claude, and opencode are also usable.
++LIZARD_TEMPLATE=interpreter
++# nano, mini, small, medium, large, or big. Defaults to the smallest size that
++# satisfies the task's memory requirement.
++LIZARD_SIZE=small
++# Active sandbox timeout in milliseconds. Defaults to 2 hours. The Lizard
++# trial caps sandbox lifetime at 1 hour.
++LIZARD_TIMEOUT_MS=...
++# Standby retention policy. Defaults to 10 paused sandboxes for 168 hours.
++# Set the count to 0 to disable retained task sandboxes.
++LIZARD_STANDBY_MAX_COUNT=10
++LIZARD_STANDBY_MAX_AGE_HOURS=168
++```
++
++These optional values are also available under **Settings > Sandboxes >
++Lizard > Advanced settings**. Process environment variables take precedence and
++appear as locked values in Settings.
++
++Roomote does not provision a worker artifact in your Lizard account during
++setup. Saving a valid API key and project is enough to configure the provider.
++
++Roomote installs its worker into each sandbox when it starts. The worker archive
++is uploaded through the Lizard filesystem API and installed by the shipped
++`install-worker.sh`, so no custom template upload is needed.
++
++## Sizes and cost
++
++Lizard bills per second while a sandbox runs. The flat hourly prices are:
++
++| Size   | vCPU | Memory | Disk | Price per hour |
++| ------ | ---- | ------ | ---- | -------------- |
++| Nano   | 0.5  | 1 GB   | 5 GB | $0.00405       |
++| Mini   | 1    | 2 GB   | 10 GB | $0.0081       |
++| Small  | 2    | 4 GB   | 20 GB | $0.0162       |
++| Medium | 4    | 8 GB   | 40 GB | $0.0324       |
++| Large  | 8    | 16 GB  | 80 GB | $0.0648       |
++| Big    | 16   | 32 GB  | 120 GB | $0.1296      |
++
++Paused sandboxes and snapshots cost $0.14 per GB-month of used disk. The trial
++runs 1 Small, 2 Mini, and 2 Nano sandboxes at a time in US regions only, and
++deletes each sandbox one hour after it starts.
++
++## Cleanup and resume behavior
++
++Roomote pauses a Lizard sandbox when retaining it for task resume. Pausing stops
++compute billing, keeps the sandbox's files, and ends running processes. A
++follow-up resume boots the sandbox fresh from its files and relaunches the
++worker.
++
++`LIZARD_STANDBY_MAX_COUNT` and `LIZARD_STANDBY_MAX_AGE_HOURS` bound how many
++paused sandboxes Roomote retains and for how long. This standby behavior
++preserves one task's machine; it is not a Roomote environment snapshot.
++
++## Environment snapshots
++
++Roomote environment snapshots map to Lizard snapshots: snapshotting an
++environment saves a `roomote-snap-*` snapshot of the whole disk, and tasks that
++start from it restore a fresh sandbox in well under a second instead of
++re-running environment setup. Snapshots restore only inside the snapshot's own
++project and region.
++
++## Verify setup
++
++1. Save the Lizard API key and project.
++2. Select Lizard as the default sandbox provider.
++3. Start a small task and confirm logs reach the task view.
++4. If the environment exposes a port, open its preview from the task view.
++5. Send a follow-up while the task sandbox is retained and confirm it resumes.
++
++## Common issues
++
++- **Authentication fails.** Confirm `LIZARD_API_KEY` is active and belongs to
++  the expected Lizard account.
++- **Sandbox creation fails with a project error.** Set `LIZARD_PROJECT` to the
++  project ID or slug the sandboxes should bill to.
++- **The worker install fails.** The chosen catalog template must ship Node. Use
++  `interpreter` (the default), `claude`, or `opencode`.
++- **A task stops after one hour.** Trial accounts cap sandbox lifetime at one
++  hour. Start a paid plan or reduce `LIZARD_TIMEOUT_MS`.
++- **A follow-up starts a new sandbox.** Check the standby count and age limits.
++  Roomote may no longer retain the previous sandbox as the task's resume target.
++- **A preview does not open.** Confirm the environment declares the port and the
++  application listens on `0.0.0.0`, not only `localhost`.
++- **Docker projects fail.** Lizard catalog templates have no Docker daemon.
++  Choose a provider with Docker support for those environments.
+diff --git a/apps/web/src/app/(onboarding)/setup/computeSetupCopy.ts b/apps/web/src/app/(onboarding)/setup/computeSetupCopy.ts
+index 309bd5d..ca219ed 100644
+--- a/apps/web/src/app/(onboarding)/setup/computeSetupCopy.ts
++++ b/apps/web/src/app/(onboarding)/setup/computeSetupCopy.ts
+@@ -48,6 +48,14 @@ const COMPUTE_CREDENTIALS_HINTS: Partial<
+     },
+     '.',
+   ],
++  lizard: [
++    'Create an API key from the ',
++    {
++      label: 'Lizard dashboard',
++      href: 'https://lizard.build/dashboard',
++    },
++    ' and copy the project ID or slug the sandboxes should bill to.',
++  ],
+ };
+ 
+ export function getComputeCredentialsHint(
+diff --git a/apps/web/src/app/(sandbox)/sessions/[sessionId]/setup/SandboxProviderPicker.tsx b/apps/web/src/app/(sandbox)/sessions/[sessionId]/setup/SandboxProviderPicker.tsx
+index 24ca881..c687885 100644
+--- a/apps/web/src/app/(sandbox)/sessions/[sessionId]/setup/SandboxProviderPicker.tsx
++++ b/apps/web/src/app/(sandbox)/sessions/[sessionId]/setup/SandboxProviderPicker.tsx
+@@ -15,6 +15,8 @@ const BRAND_ICON_BY_PROVIDER = {
+   e2b: 'e2b',
+   blaxel: 'blaxel',
+   box: 'box-sandbox',
++  sprites: 'fly',
++  lizard: 'lizard',
+   azure: 'azure',
+   roomote: 'roomote',
+ } satisfies Record<ComputeProvider, string>;
+diff --git a/apps/web/src/app/(sandbox)/task/[taskId]/sidebar-panels/TaskInfoPanel.tsx b/apps/web/src/app/(sandbox)/task/[taskId]/sidebar-panels/TaskInfoPanel.tsx
+index ae1a727..5f70d8b 100644
+--- a/apps/web/src/app/(sandbox)/task/[taskId]/sidebar-panels/TaskInfoPanel.tsx
++++ b/apps/web/src/app/(sandbox)/task/[taskId]/sidebar-panels/TaskInfoPanel.tsx
+@@ -86,6 +86,8 @@ const SANDBOX_PROVIDER_LABELS = {
+   e2b: 'E2B',
+   blaxel: 'Blaxel',
+   box: 'Box',
++  sprites: 'Fly.io Sprites',
++  lizard: 'Lizard',
+   azure: 'Azure',
+   roomote: 'Roomote Cloud',
+ } satisfies Record<ComputeProvider, string>;
+@@ -97,6 +99,8 @@ const SANDBOX_PROVIDER_ICONS = {
+   e2b: CloudIcon,
+   blaxel: CloudIcon,
+   box: CloudIcon,
++  sprites: CloudIcon,
++  lizard: CloudIcon,
+   azure: CloudIcon,
+   roomote: CloudIcon,
+ } satisfies Record<ComputeProvider, typeof CloudIcon>;
+diff --git a/apps/web/src/components/settings/ComputeProviderSection.tsx b/apps/web/src/components/settings/ComputeProviderSection.tsx
+index ce13b85..b76352f 100644
+--- a/apps/web/src/components/settings/ComputeProviderSection.tsx
++++ b/apps/web/src/components/settings/ComputeProviderSection.tsx
+@@ -53,6 +53,8 @@ const BRAND_ICON_BY_PROVIDER: Record<ComputeProvider, string> = {
+   e2b: 'e2b',
+   blaxel: 'blaxel',
+   box: 'box-sandbox',
++  sprites: 'fly',
++  lizard: 'lizard',
+   azure: 'azure',
+   roomote: 'roomote',
+ };
+diff --git a/apps/web/src/components/system/custom/logos/brand-icon.tsx b/apps/web/src/components/system/custom/logos/brand-icon.tsx
+index 12a4533..929d530 100644
+--- a/apps/web/src/components/system/custom/logos/brand-icon.tsx
++++ b/apps/web/src/components/system/custom/logos/brand-icon.tsx
+@@ -7,6 +7,7 @@ import {
+   siBuildkite,
+   siCloudflare,
+   siElevenlabs,
++  siFlydotio,
+   siDependabot,
+   siDatadog,
+   siDiscord,
+@@ -60,6 +61,7 @@ const SIMPLE_ICONS: Record<string, SimpleIcon> = {
+   jira: siJira,
+   linear: siLinear,
+   modal: siModal,
++  fly: siFlydotio,
+   notion: siNotion,
+   pagerduty: siPagerduty,
+   posthog: siPosthog,
+@@ -203,6 +205,37 @@ function BlaxelIcon({
+   );
+ }
+ 
++const LIZARD_ICON_PATH =
++  'M78.115,19.738c1.451-0.486,3.18-0.973,5.911-3.152c2.734-2.176,5.204-6.027,5.757-7.176 c0.552-1.147,1.226-2.145,0.893-2.642c-0.337-0.493-1.796-0.631-3.059-0.114c-1.26,0.516-4.505,1.152-5.735,1.739 c-1.234,0.59-2.403,1.18-3.317,2.161c-0.915,0.985-2.536,4.41-4.401,5.024c-1.864,0.612-3.314,1.198-4.153,0.787 c-0.837-0.415-1.372-0.813-0.818-1.277c0.555-0.463,1.488-1.563,1.998-1.517c0.506,0.047,0.995,0.237,1.472,0.592 c0.476,0.356,1.04,0.895,1.356,0.51c0.315-0.388-0.623-0.72-1.024-0.934c-0.4-0.214-0.19-0.877,0.127-0.922 c0.313-0.042,3.799-0.121,3.678-0.842c-0.12-0.724-3.362,0.317-3.416-0.08c-0.051-0.4,0.254-1.037,1.184-1.575 c0.932-0.543,3.102-1.62,2.982-2.173c-0.122-0.555-2.69,1.635-3.476,2.166c-0.785,0.53-1.293,0.685-1.578,0.494 c-0.285-0.19,0.193-2.026,0.748-2.77c0.555-0.743,1.802-2.558,1.083-2.615c-0.719-0.063-1.28,2.123-1.682,3.105 c-0.398,0.983-1.314,2.79-1.707,2.457c-0.393-0.336-0.662-3.534-1.443-3.115c-0.782,0.421,0.937,1.87,0.624,3.238 c-0.312,1.369-0.347,1.584-0.837,1.873c-0.49,0.292-1.772,0.859-2.281,1.496c-0.509,0.641-0.575,1.606-0.098,2.059 c0.479,0.449,0.779,0.675,0.436,0.786c-0.344,0.11-6.629,0.721-10.204,1.403c-1.304,0.249-8.559,2.154-8.81,1.781 c-0.253-0.372,1.38-3.801,1.36-4.626c-0.02-0.826-0.641-1.204-1.425-1.326c-0.784-0.125-2.396-0.788-2.354-1.028 c0.035-0.237-0.09-0.622,0.725-0.925c0.815-0.308,4.295-1.545,3.936-2.244c-0.355-0.701-4.486,2.272-4.614,2.144 c-0.126-0.128,3.173-5.74,2.083-5.956c-1.092-0.217-2.646,6.117-2.977,5.874c-0.335-0.246-0.439-7.29-1.529-7.041 c-1.095,0.252,1.112,6.621,0.58,6.611c-0.531-0.01-2.238-3.329-2.764-2.893c-0.527,0.437,2.814,3.452,2.63,3.856 c-0.188,0.405-1.173,0.935-0.481,1.412c0.692,0.48,2.896,1.787,2.699,2.374c-0.197,0.587-1.34,1.606-1.871,3.135 c-0.533,1.531-0.558,3.014-0.988,3.144c-0.432,0.131-12.346,6.088-17.82,11.99c-6.477,6.979-11.541,18.665-10.131,30.234 c1.058,8.675,4.525,20.307,13.588,28.774c0,0,2.07,1.551,0.086-0.725c-2.09-2.395-6.535-8.131-9.683-20.572 c-3.226-12.749,1.267-23.968,5.17-28.82c5.044-6.27,13.273-12.174,18.075-13.883c3.229-1.15,3.06-1.592,3.481-1.498 c0.421,0.101,4.8,0.833,4.699,1.254c-0.101,0.423-1.295,4.59-0.821,5.086c0.475,0.496,4.383,1.949,4.383,1.949 s1.791,3.753,2.304,3.497c0.513-0.259-1.475-3.47-1.259-3.487c0.219-0.018,4.699,1.974,5.547,2.011 c0.846,0.033,0.968-1.003,0.389-1.316c-0.582-0.31-5.645-1.03-5.62-1.18c0.022-0.156,6.432-1.061,5.898-2.355 c-0.529-1.292-6.186,1.756-6.314,1.58c-0.131-0.175,3.575-3.549,2.825-4.056c-0.75-0.502-2.943,4.002-3.096,3.725 c-0.151-0.281,1.033-4.778,0.13-4.794c-0.903-0.013-0.523,4.38-0.988,4.427c-0.464,0.042-1.899-1.006-1.616-1.879 c0.281-0.874,1.59-3.289,1.584-3.944c-0.002-0.657-0.063-1.24,0.448-1.24c0.515,0,5.939,0.278,9.31-0.262 c3.372-0.544,7.811-2.348,8.37-2.092c0.561,0.253,1.327,1.732,1.926,2.329c0.597,0.599,2.671,1.028,3.434,1.127 c0.764,0.098,1.085,0.417,1.288,0.556c0.201,0.139,1.271,1.542,1.399,1.942c0.129,0.403-0.033,1.343,0.594,1.502 c0.626,0.158,1.268-0.637,0.573-1.267c-0.692-0.623-1.328-1.349-1.293-1.628c0.034-0.278,0.297-0.719,1.09-0.375 c0.79,0.344,4.606,2.859,5.049,2.053c0.444-0.809-5.119-2.006-5.112-2.33c0.009-0.324-0.069-0.871,1.033-0.836 c1.104,0.035,5.334,0.174,5.063-0.496c-0.271-0.667-5.114,0.269-5.277-0.255c-0.166-0.528,3.11-1.85,2.483-2.555 c-0.628-0.705-2.738,1.848-3.375,1.775c-0.636-0.071-0.962-0.857-0.883-1.303s0.377-0.932,0.058-1.187 c-0.318-0.256-0.797,0.042-0.729,0.476c0.067,0.436,0.082,1.842-0.346,1.955c-0.427,0.119-3.066-0.164-3.421-0.855 c-0.354-0.689-0.717-2.457-0.464-3.183C75.612,22.162,76.662,20.23,78.115,19.738z M64.022,18.998c0.266,0,0.479,0.215,0.479,0.481 c0,0.265-0.214,0.48-0.479,0.48s-0.48-0.215-0.48-0.48C63.542,19.213,63.757,18.998,64.022,18.998z M55.022,20.998 c0.266,0,0.479,0.215,0.479,0.481c0,0.265-0.214,0.48-0.479,0.48s-0.48-0.215-0.48-0.48C54.542,21.213,54.757,20.998,55.022,20.998z M51.022,24.958c-0.266,0-0.48-0.215-0.48-0.48c0-0.266,0.215-0.481,0.48-0.481s0.479,0.215,0.479,0.481 C51.502,24.743,51.288,24.958,51.022,24.958z M60.022,23.958c-0.266,0-0.48-0.215-0.48-0.48c0-0.266,0.215-0.481,0.48-0.481 s0.479,0.215,0.479,0.481C60.502,23.743,60.288,23.958,60.022,23.958z M69.022,21.958c-0.266,0-0.48-0.215-0.48-0.48 c0-0.266,0.215-0.481,0.48-0.481s0.479,0.215,0.479,0.481C69.502,21.743,69.288,21.958,69.022,21.958z M73.933,18.79 c-0.072,0.049-0.152,0.107-0.238,0.169c-0.558,0.402-1.394,1.013-2.341,0.952c-0.341-0.021-0.708-0.089-1.064-0.155 c-0.647-0.119-1.319-0.242-1.849-0.098c-0.842,0.229-1.263,0.727-1.708,1.253c-0.475,0.562-0.966,1.142-1.958,1.413 c-1.068,0.292-2.188-0.145-3.175-0.53c-0.797-0.311-1.55-0.606-2.125-0.468c-0.574,0.135-0.941,0.545-1.367,1.02 c-0.534,0.597-1.141,1.273-2.297,1.563c-1.129,0.279-2.105-0.056-2.97-0.353c-0.738-0.253-1.434-0.494-2.11-0.314 c-0.63,0.166-1.082,0.559-1.562,0.976c-0.663,0.577-1.351,1.174-2.538,1.2c-0.363,0.01-0.689-0.003-0.99-0.014 c-1.136-0.038-1.826-0.062-2.787,1.013c-1.287,1.44-2.365,1.51-3.314,1.57c-0.576,0.037-1.074,0.069-1.556,0.414 c-0.409,0.293-0.678,0.614-0.962,0.953c-0.39,0.466-0.793,0.948-1.564,1.338c-0.338,0.17-0.73,0.269-1.146,0.373 c-0.775,0.194-1.654,0.414-2.558,1.169c-0.003,0.002-0.007,0.001-0.01,0.003s-0.002,0.006-0.005,0.008 c-0.122,0.088-12.286,8.943-14.576,23.129c-0.02,0.123-0.126,0.21-0.246,0.21c-0.013,0-0.026-0.001-0.04-0.003 c-0.137-0.022-0.229-0.069-0.207-0.206c2.323-14.396,14.653-23.295,14.654-23.296c1.395-1.142,2.084-1.223,2.866-1.419 c0.403-0.101,0.753-0.229,1.04-0.374c0.681-0.344,1.034-0.787,1.408-1.233c0.291-0.348,0.592-0.717,1.054-1.048 c0.599-0.429,1.216-0.474,1.813-0.512c0.896-0.058,1.824-0.12,2.975-1.407c1.117-1.25,1.979-1.222,3.178-1.181 c0.293,0.009,0.608,0.021,0.961,0.012c1.008-0.022,1.598-0.535,2.222-1.077c0.501-0.436,1.02-0.887,1.763-1.082 c0.82-0.215,1.589,0.046,2.399,0.325c0.837,0.288,1.701,0.585,2.687,0.34c1.008-0.252,1.535-0.841,2.046-1.411 c0.462-0.515,0.897-1.002,1.624-1.173c0.728-0.171,1.551,0.149,2.422,0.489c0.96,0.374,1.952,0.761,2.862,0.513 c0.842-0.229,1.263-0.727,1.708-1.253c0.475-0.562,0.966-1.142,1.958-1.413c0.64-0.173,1.366-0.04,2.07,0.089 c0.357,0.066,0.694,0.128,1.005,0.147c0.755,0.047,1.486-0.476,2.017-0.858c0.091-0.065,0.174-0.125,0.25-0.177 c0.113-0.078,0.27-0.048,0.347,0.065C74.076,18.557,74.047,18.712,73.933,18.79z';
++
++/**
++ * Lizard's brand mark. Kept as a single path so the picker renders the real
++ * logo without depending on a third-party icon package.
++ */
++function LizardIcon({
++  name,
++  className,
++  isDecorative,
++}: {
++  name: string;
++  className?: string;
++  isDecorative: boolean;
++}) {
++  return (
++    <svg
++      viewBox="5 4 90 92"
++      role={isDecorative ? undefined : 'img'}
++      aria-hidden={isDecorative || undefined}
++      aria-label={isDecorative ? undefined : name}
++      focusable="false"
++      fill="currentColor"
++      className={className}
++    >
++      <path d={LIZARD_ICON_PATH} />
++    </svg>
++  );
++}
++
+ function BoxSandboxIcon({
+   name,
+   className,
+@@ -768,6 +801,16 @@ export function BrandIcon({ icon, name, className }: BrandIconProps) {
+     );
+   }
+ 
++  if (icon === 'lizard') {
++    return (
++      <LizardIcon
++        name={name}
++        className={className}
++        isDecorative={isDecorative}
++      />
++    );
++  }
++
+   if (icon === 'daytona') {
+     return (
+       <DaytonaIcon
+diff --git a/packages/compute-providers/src/index.ts b/packages/compute-providers/src/index.ts
+index 97713d3..34e4af8 100644
+--- a/packages/compute-providers/src/index.ts
++++ b/packages/compute-providers/src/index.ts
+@@ -23,5 +23,6 @@ export * from './adapters/box';
+ export * from './box';
+ export * from './adapters/sprites';
+ export * from './adapters/lizard';
++export * from './lizard';
+ export * from './adapters/azure';
+ export * from './azure';
+diff --git a/packages/compute-providers/src/lizard/create-lizard-machine.ts b/packages/compute-providers/src/lizard/create-lizard-machine.ts
+new file mode 100644
+index 0000000..d08cd1e
+--- /dev/null
++++ b/packages/compute-providers/src/lizard/create-lizard-machine.ts
+@@ -0,0 +1,302 @@
++import {
++  type ComputeProviderLaunchMode,
++  type NamedPort,
++  serializeError,
++} from '@roomote/types';
++
++import { generateProxyPorts, getExposedPorts } from '../environment-machine';
++import { createComputeProviderClient } from '../factory';
++import { throwIfAborted } from '../modal/abort';
++import { loadSandboxBootstrapFiles } from '../sandbox/bootstrap-files';
++import { getWorkerRelease } from '../sandbox/worker-release-cache';
++import { loadLocalWorkerReleaseWithVersion } from '../sandbox/utils';
++import type {
++  ComputeProviderClient,
++  ComputeProviderMutationObserver,
++  LizardConfig,
++} from '../types';
++
++const REMOTE_BOOTSTRAP_DIR = '/tmp/roomote-bootstrap';
++const INSTALL_SCRIPT_PATH = `${REMOTE_BOOTSTRAP_DIR}/install-worker.sh`;
++const WORKER_TARBALL_PATH = `${REMOTE_BOOTSTRAP_DIR}/worker.tar.gz`;
++
++type LizardLifecycleClient = Pick<
++  ComputeProviderClient,
++  | 'vendor'
++  | 'createInstance'
++  | 'resumeFromStandby'
++  | 'resumeFromSnapshot'
++  | 'writeFiles'
++  | 'runCommand'
++  | 'getInstanceDomains'
++  | 'destroyInstance'
++  | 'enterStandby'
++>;
++
++export interface CreateLizardMachineOptions {
++  apiKey: string;
++  project: string;
++  apiUrl?: string;
++  template?: string;
++  size?: LizardConfig['size'];
++  timeoutMs?: number;
++  idempotencyKey?: string;
++  namedPorts?: NamedPort[];
++  proxyPorts?: Record<string, number>;
++  localTarballPath?: string;
++  signal?: AbortSignal;
++  bootstrapTimeoutMs?: number;
++  computeClient?: LizardLifecycleClient;
++  onMutation?: ComputeProviderMutationObserver;
++}
++
++export interface LizardMachine {
++  machineId: string;
++  proxyPorts: Record<string, number>;
++  sourceSnapshotId?: string;
++  domain: (port: number) => string;
++}
++
++export type LizardLaunchOptions =
++  | {
++      launchMode: 'fresh';
++      resumeHandle?: undefined;
++      sourceSnapshotId?: undefined;
++    }
++  | {
++      launchMode: 'task_standby';
++      resumeHandle: string;
++      sourceSnapshotId?: undefined;
++    }
++  | {
++      /** Fork a named snapshot (environment template). */
++      launchMode: 'environment_snapshot' | 'task_snapshot';
++      sourceSnapshotId: string;
++      resumeHandle?: undefined;
++    };
++
++export type CreateLizardMachineParams = CreateLizardMachineOptions &
++  LizardLaunchOptions;
++
++export async function createLizardMachine(
++  options: CreateLizardMachineParams,
++): Promise<LizardMachine> {
++  throwIfAborted(options.signal);
++
++  const proxyPorts =
++    options.proxyPorts ?? generateProxyPorts(options.namedPorts);
++  const ports = getExposedPorts(options.namedPorts, proxyPorts);
++  const forkSnapshotId =
++    options.launchMode === 'environment_snapshot' ||
++    options.launchMode === 'task_snapshot'
++      ? options.sourceSnapshotId
++      : undefined;
++
++  // Fresh and forked sandboxes need the worker installed; standby resumes
++  // reuse the same sandbox as-is. Forks restore a snapshot that already holds a
++  // worker, but it is refreshed so the shipped worker matches the current
++  // runtime protocol.
++  const release =
++    options.launchMode !== 'task_standby'
++      ? options.localTarballPath
++        ? loadLocalWorkerReleaseWithVersion(options.localTarballPath)
++        : await getWorkerRelease()
++      : undefined;
++
++  const config: LizardConfig = {
++    apiKey: options.apiKey,
++    project: options.project,
++    ...(options.apiUrl ? { apiUrl: options.apiUrl } : {}),
++    ...(options.template ? { template: options.template } : {}),
++    ...(options.size ? { size: options.size } : {}),
++    ...(options.timeoutMs !== undefined
++      ? { timeoutMs: options.timeoutMs }
++      : {}),
++  };
++
++  const computeClient =
++    options.computeClient ??
++    createComputeProviderClient({ provider: 'lizard', config });
++
++  if (computeClient.vendor !== 'lizard') {
++    throw new Error('createLizardMachine requires a Lizard compute client');
++  }
++
++  const operation = options.resumeHandle
++    ? 'resume_from_standby'
++    : forkSnapshotId
++      ? 'resume_from_snapshot'
++      : 'create_instance';
++  const operationLabel = options.resumeHandle
++    ? 'resumeFromStandby'
++    : forkSnapshotId
++      ? 'resumeFromSnapshot'
++      : 'createInstance';
++  const mutationSourceSnapshotId =
++    options.resumeHandle ?? forkSnapshotId ?? null;
++
++  await options.onMutation?.({
++    provider: 'lizard',
++    operation,
++    eventType: 'started',
++    message: options.resumeHandle
++      ? `Calling resumeFromStandby for Lizard sandbox ${options.resumeHandle}.`
++      : forkSnapshotId
++        ? `Calling resumeFromSnapshot for Lizard sandbox from ${forkSnapshotId}.`
++        : 'Calling createInstance for Lizard.',
++    details: {
++      launchMode: options.launchMode as ComputeProviderLaunchMode,
++      sourceSnapshotId: mutationSourceSnapshotId,
++      ports,
++    },
++  });
++
++  let created: { instanceId: string };
++  try {
++    if (options.resumeHandle) {
++      if (!computeClient.resumeFromStandby) {
++        throw new Error(
++          'Lizard compute client does not support standby resume',
++        );
++      }
++
++      created = await computeClient.resumeFromStandby({
++        resumeHandle: options.resumeHandle,
++        ports,
++        signal: options.signal,
++      });
++    } else if (forkSnapshotId) {
++      created = await computeClient.resumeFromSnapshot({
++        sourceSnapshotId: forkSnapshotId,
++        idempotencyKey: options.idempotencyKey,
++        ports,
++        metadata: release
++          ? { workerReleaseTag: `worker-v${release.version}` }
++          : undefined,
++        signal: options.signal,
++      });
++    } else {
++      created = await computeClient.createInstance({
++        idempotencyKey: options.idempotencyKey,
++        ports,
++        metadata: release
++          ? { workerReleaseTag: `worker-v${release.version}` }
++          : undefined,
++        signal: options.signal,
++      });
++    }
++
++    await options.onMutation?.({
++      provider: 'lizard',
++      operation,
++      eventType: 'completed',
++      instanceId: created.instanceId,
++      message: `${operationLabel} completed for Lizard sandbox ${created.instanceId}.`,
++      details: {
++        launchMode: options.launchMode as ComputeProviderLaunchMode,
++        sourceSnapshotId: mutationSourceSnapshotId,
++        ports,
++      },
++    });
++  } catch (error) {
++    await options.onMutation?.({
++      provider: 'lizard',
++      operation,
++      eventType: 'failed',
++      message: `${operationLabel} failed for Lizard.`,
++      details: {
++        launchMode: options.launchMode as ComputeProviderLaunchMode,
++        sourceSnapshotId: mutationSourceSnapshotId,
++        ports,
++        error: serializeError(error).message,
++      },
++    });
++    throw error;
++  }
++
++  if (release) {
++    const bootstrapTimeoutSignal = options.bootstrapTimeoutMs
++      ? AbortSignal.timeout(options.bootstrapTimeoutMs)
++      : undefined;
++    const bootstrapSignal =
++      bootstrapTimeoutSignal && options.signal
++        ? AbortSignal.any([bootstrapTimeoutSignal, options.signal])
++        : (bootstrapTimeoutSignal ?? options.signal);
++
++    try {
++      const { files } = loadSandboxBootstrapFiles(REMOTE_BOOTSTRAP_DIR);
++      files.push({ path: WORKER_TARBALL_PATH, content: release.archive });
++
++      await computeClient.writeFiles({
++        instanceId: created.instanceId,
++        files,
++        signal: bootstrapSignal,
++      });
++
++      const install = await computeClient.runCommand({
++        instanceId: created.instanceId,
++        cmd: 'bash',
++        args: [INSTALL_SCRIPT_PATH],
++        env: {
++          // Lizard runs sandbox commands as root; install and launch must agree
++          // on HOME so the worker's state lands where it later looks for it.
++          HOME: '/root',
++          WORKER_RELEASE_ARCHIVE_PATH: WORKER_TARBALL_PATH,
++        },
++        signal: bootstrapSignal,
++      });
++
++      if (install.exitCode !== 0) {
++        throw new Error(
++          `Lizard worker install failed with exit code ${install.exitCode}: ${install.stderr ?? install.stdout ?? 'no output'}`,
++        );
++      }
++    } catch (error) {
++      await computeClient
++        .destroyInstance({ instanceId: created.instanceId })
++        .catch(() => {});
++      throw error;
++    }
++  }
++
++  let domains: Record<string, string> | undefined;
++  try {
++    domains = ports.length
++      ? (
++          await computeClient.getInstanceDomains?.({
++            instanceId: created.instanceId,
++            ports,
++            signal: options.signal,
++          })
++        )?.domains
++      : {};
++    if (ports.length && !domains) {
++      throw new Error('Lizard compute client does not support preview URLs');
++    }
++  } catch (error) {
++    const cleanup = options.resumeHandle
++      ? computeClient.enterStandby?.({ instanceId: created.instanceId })
++      : computeClient.destroyInstance({ instanceId: created.instanceId });
++    await cleanup?.catch(() => {});
++    throw error;
++  }
++
++  const sourceSnapshotId = options.resumeHandle ?? forkSnapshotId;
++
++  return {
++    machineId: created.instanceId,
++    proxyPorts,
++    ...(sourceSnapshotId ? { sourceSnapshotId } : {}),
++    domain: (port: number) => {
++      const domain = domains?.[String(port)];
++
++      if (!domain) {
++        throw new Error(
++          `Lizard sandbox ${created.instanceId} has no URL for port ${port}`,
++        );
++      }
++
++      return domain;
++    },
++  };
++}
+diff --git a/packages/compute-providers/src/lizard/index.ts b/packages/compute-providers/src/lizard/index.ts
+new file mode 100644
+index 0000000..0068dcc
+--- /dev/null
++++ b/packages/compute-providers/src/lizard/index.ts
+@@ -0,0 +1 @@
++export * from './create-lizard-machine';
+diff --git a/packages/compute-providers/src/worker-env/index.ts b/packages/compute-providers/src/worker-env/index.ts
+index 90699bf..86ff004 100644
+--- a/packages/compute-providers/src/worker-env/index.ts
++++ b/packages/compute-providers/src/worker-env/index.ts
+@@ -4,4 +4,5 @@ export * from './daytona';
+ export * from './e2b';
+ export * from './blaxel';
+ export * from './box';
++export * from './lizard';
+ export * from './azure';
+diff --git a/packages/compute-providers/src/worker-env/lizard.ts b/packages/compute-providers/src/worker-env/lizard.ts
+new file mode 100644
+index 0000000..3f8cebb
+--- /dev/null
++++ b/packages/compute-providers/src/worker-env/lizard.ts
+@@ -0,0 +1,33 @@
++import { buildBaseWorkerEnv } from './base';
++import { buildWorkerContextEnv } from './context';
++import type { BuildWorkerEnvOptions } from './types';
++
++export function buildLizardWorkerEnv({
++  authToken,
++  sandboxExpiresAtMs,
++  extraEnv,
++  deploymentSlug,
++  environmentId,
++  size,
++}: BuildWorkerEnvOptions & {
++  deploymentSlug?: string;
++  size?: string;
++}): Record<string, string> {
++  return {
++    ...buildBaseWorkerEnv({
++      authToken,
++      sandboxExpiresAtMs,
++      extraEnv,
++      environmentId,
++    }),
++    ...buildWorkerContextEnv({
++      provider: 'lizard',
++      fingerprint: size,
++      fingerprintKind: size ? 'runtime' : undefined,
++      deploymentSlug,
++      environmentId,
++    }),
++    // Lizard sandbox commands run as root, so the worker's HOME is /root.
++    HOME: '/root',
++  };
++}
+diff --git a/packages/db/src/schema.ts b/packages/db/src/schema.ts
+index d0f38a2..3205817 100644
+--- a/packages/db/src/schema.ts
++++ b/packages/db/src/schema.ts
+@@ -1824,17 +1824,17 @@ export const taskRuns = pgTable(
+     index('task_runs_sleep_check_due_v2_idx')
+       .using('btree', table.sleepAt, table.createdAt, table.vendor)
+       .where(
+-        sql`${table.status} IN ('running', 'idle') AND ${table.machineId} IS NOT NULL AND ${table.sleepAt} IS NOT NULL AND ${table.sleepRequestedAt} IS NULL AND ${table.snapshotId} IS NULL AND ${table.snapshotRequestedAt} IS NULL AND ${table.vendor} IN ('modal', 'daytona', 'e2b', 'docker', 'blaxel', 'box', 'roomote', 'azure')`,
++        sql`${table.status} IN ('running', 'idle') AND ${table.machineId} IS NOT NULL AND ${table.sleepAt} IS NOT NULL AND ${table.sleepRequestedAt} IS NULL AND ${table.snapshotId} IS NULL AND ${table.snapshotRequestedAt} IS NULL AND ${table.vendor} IN ('modal', 'daytona', 'e2b', 'docker', 'blaxel', 'box', 'sprites', 'lizard', 'roomote', 'azure')`,
+       ),
+     index('task_runs_sleep_check_stale_worker_v2_idx')
+       .using('btree', table.workerHeartbeatAt, table.createdAt, table.vendor)
+       .where(
+-        sql`${table.status} IN ('running', 'idle') AND ${table.machineId} IS NOT NULL AND ${table.workerHeartbeatAt} IS NOT NULL AND ${table.sleepRequestedAt} IS NULL AND ${table.snapshotId} IS NULL AND ${table.snapshotRequestedAt} IS NULL AND ${table.vendor} IN ('modal', 'daytona', 'e2b', 'docker', 'blaxel', 'box', 'roomote', 'azure')`,
++        sql`${table.status} IN ('running', 'idle') AND ${table.machineId} IS NOT NULL AND ${table.workerHeartbeatAt} IS NOT NULL AND ${table.sleepRequestedAt} IS NULL AND ${table.snapshotId} IS NULL AND ${table.snapshotRequestedAt} IS NULL AND ${table.vendor} IN ('modal', 'daytona', 'e2b', 'docker', 'blaxel', 'box', 'sprites', 'lizard', 'roomote', 'azure')`,
+       ),
+     index('task_runs_sleep_check_active_v2_idx')
+       .using('btree', table.vendor, table.createdAt.desc())
+       .where(
+-        sql`${table.status} IN ('running', 'idle') AND ${table.machineId} IS NOT NULL AND ${table.sleepRequestedAt} IS NULL AND ${table.snapshotId} IS NULL AND ${table.snapshotRequestedAt} IS NULL AND ${table.vendor} IN ('modal', 'daytona', 'e2b', 'docker', 'blaxel', 'box', 'roomote', 'azure')`,
++        sql`${table.status} IN ('running', 'idle') AND ${table.machineId} IS NOT NULL AND ${table.sleepRequestedAt} IS NULL AND ${table.snapshotId} IS NULL AND ${table.snapshotRequestedAt} IS NULL AND ${table.vendor} IN ('modal', 'daytona', 'e2b', 'docker', 'blaxel', 'box', 'sprites', 'lizard', 'roomote', 'azure')`,
+       ),
+     // Finished runs whose sandbox sleep check has not yet examined (see
+     // destroySandboxesOfFinishedRuns). Keyed on the settlement time the sweep
+@@ -1843,12 +1843,12 @@ export const taskRuns = pgTable(
+     index('task_runs_sleep_check_finished_completed_idx')
+       .using('btree', table.completedAt)
+       .where(
+-        sql`${table.status} IN ('failed', 'canceled', 'completed') AND ${table.machineId} IS NOT NULL AND ${table.sleepRequestedAt} IS NULL AND ${table.snapshotId} IS NULL AND ${table.snapshotRequestedAt} IS NULL AND ${table.vendor} IN ('modal', 'daytona', 'e2b', 'docker', 'blaxel', 'box', 'roomote', 'azure') AND ${table.completedAt} IS NOT NULL`,
++        sql`${table.status} IN ('failed', 'canceled', 'completed') AND ${table.machineId} IS NOT NULL AND ${table.sleepRequestedAt} IS NULL AND ${table.snapshotId} IS NULL AND ${table.snapshotRequestedAt} IS NULL AND ${table.vendor} IN ('modal', 'daytona', 'e2b', 'docker', 'blaxel', 'box', 'sprites', 'lizard', 'roomote', 'azure') AND ${table.completedAt} IS NOT NULL`,
+       ),
+     index('task_runs_sleep_check_finished_canceled_idx')
+       .using('btree', table.canceledAt)
+       .where(
+-        sql`${table.status} IN ('failed', 'canceled', 'completed') AND ${table.machineId} IS NOT NULL AND ${table.sleepRequestedAt} IS NULL AND ${table.snapshotId} IS NULL AND ${table.snapshotRequestedAt} IS NULL AND ${table.vendor} IN ('modal', 'daytona', 'e2b', 'docker', 'blaxel', 'box', 'roomote', 'azure') AND ${table.completedAt} IS NULL AND ${table.canceledAt} IS NOT NULL`,
++        sql`${table.status} IN ('failed', 'canceled', 'completed') AND ${table.machineId} IS NOT NULL AND ${table.sleepRequestedAt} IS NULL AND ${table.snapshotId} IS NULL AND ${table.snapshotRequestedAt} IS NULL AND ${table.vendor} IN ('modal', 'daytona', 'e2b', 'docker', 'blaxel', 'box', 'sprites', 'lizard', 'roomote', 'azure') AND ${table.completedAt} IS NULL AND ${table.canceledAt} IS NOT NULL`,
+       ),
+     index('task_runs_source_snapshot_id_idx').on(table.sourceSnapshotId),
+     index('task_runs_source_run_id_idx').on(table.sourceRunId),
+diff --git a/packages/env/src/index.ts b/packages/env/src/index.ts
+index 2f8f987..a15fafc 100644
+--- a/packages/env/src/index.ts
++++ b/packages/env/src/index.ts
+@@ -380,6 +380,16 @@ const serverSchema = {
+   BOX_API_BASE_URL: z.string().url().optional(),
+   BOX_MACHINE_TYPE: z.enum(['small', 'default', 'large']).optional(),
+   BOX_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
++  LIZARD_API_KEY: z.string().min(1).optional(),
++  LIZARD_PROJECT: z.string().min(1).optional(),
++  LIZARD_API_URL: z.string().url().optional(),
++  LIZARD_TEMPLATE: z.string().min(1).optional(),
++  LIZARD_SIZE: z
++    .enum(['nano', 'mini', 'small', 'medium', 'large', 'big'])
++    .optional(),
++  LIZARD_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
++  LIZARD_STANDBY_MAX_COUNT: z.coerce.number().int().nonnegative().optional(),
++  LIZARD_STANDBY_MAX_AGE_HOURS: z.coerce.number().positive().optional(),
+   E2B_DOMAIN: z.string().optional(),
+   E2B_TEMPLATE_ID: z.string().optional(),
+   AZURE_SUBSCRIPTION_ID: z.string().optional(),
+@@ -776,6 +786,14 @@ const OPTIONAL_NON_EMPTY_KEYS = new Set([
+   'BOX_TIMEOUT_MS',
+   'BOX_STANDBY_MAX_COUNT',
+   'BOX_STANDBY_MAX_AGE_HOURS',
++  'LIZARD_API_KEY',
++  'LIZARD_PROJECT',
++  'LIZARD_API_URL',
++  'LIZARD_TEMPLATE',
++  'LIZARD_SIZE',
++  'LIZARD_TIMEOUT_MS',
++  'LIZARD_STANDBY_MAX_COUNT',
++  'LIZARD_STANDBY_MAX_AGE_HOURS',
+   'E2B_DOMAIN',
+   'E2B_TEMPLATE_ID',
+   'E2B_MAX_SANDBOX_TIMEOUT_MS',
+diff --git a/packages/sdk/src/server/lib/task-runs/record-compute-provider-usage.ts b/packages/sdk/src/server/lib/task-runs/record-compute-provider-usage.ts
+index 33f4e6a..83a0308 100644
+--- a/packages/sdk/src/server/lib/task-runs/record-compute-provider-usage.ts
++++ b/packages/sdk/src/server/lib/task-runs/record-compute-provider-usage.ts
+@@ -349,6 +349,40 @@ const computeProviderUsagePolicies: Record<
+         source: 'worker_azure_cgroup_poll',
+       });
+ 
++      return {
++        activeCpuDurationMs: context.inputActiveCpuDurationMs,
++        observedMemoryMibMilliseconds:
++          context.inputObservedMemoryMibMilliseconds,
++        detailPatch: {},
++        preferredMeasurementSource: 'roomote_observation',
++      };
++    },
++  },
++  sprites: {
++    async deriveUsage(context) {
++      await recordComputeProviderUsageSampleIfPresent({
++        context,
++        provider: 'sprites',
++        source: 'worker_sprites_cgroup_poll',
++      });
++
++      return {
++        activeCpuDurationMs: context.inputActiveCpuDurationMs,
++        observedMemoryMibMilliseconds:
++          context.inputObservedMemoryMibMilliseconds,
++        detailPatch: {},
++        preferredMeasurementSource: 'roomote_observation',
++      };
++    },
++  },
++  lizard: {
++    async deriveUsage(context) {
++      await recordComputeProviderUsageSampleIfPresent({
++        context,
++        provider: 'lizard',
++        source: 'worker_lizard_cgroup_poll',
++      });
++
+       return {
+         activeCpuDurationMs: context.inputActiveCpuDurationMs,
+         observedMemoryMibMilliseconds:
+diff --git a/packages/types/src/compute-provider-usage.ts b/packages/types/src/compute-provider-usage.ts
+index 910b5c3..8d62bec 100644
+--- a/packages/types/src/compute-provider-usage.ts
++++ b/packages/types/src/compute-provider-usage.ts
+@@ -77,6 +77,8 @@ export function resolveConfiguredComputeProviderResources(input: {
+     case 'e2b':
+     case 'blaxel':
+     case 'box':
++    case 'sprites':
++    case 'lizard':
+     case 'azure':
+       return {
+         configuredVcpus: null,
+diff --git a/packages/types/src/setup-compute-config.ts b/packages/types/src/setup-compute-config.ts
+index cd8203c..10c9d7a 100644
+--- a/packages/types/src/setup-compute-config.ts
++++ b/packages/types/src/setup-compute-config.ts
+@@ -580,6 +580,156 @@ export const SETUP_COMPUTE_PROVIDER_CATALOG = [
+       },
+     ],
+   },
++  {
++    provider: 'sprites',
++    label: 'Fly.io Sprites',
++    description:
++      'Persistent Ubuntu VMs with Docker pre-installed and native idle hibernate. Standby-resume only; no product snapshots.',
++    supportsSnapshots: false,
++    fields: [
++      {
++        envVarName: 'SPRITE_TOKEN',
++        label: 'Sprites API Token',
++        secret: true,
++        category: 'credential',
++      },
++      {
++        envVarName: 'SPRITES_API_BASE_URL',
++        label: 'Sprites API Base URL',
++        required: false,
++        category: 'infrastructure',
++        advanced: true,
++        helpText: 'Leave blank for https://api.sprites.dev.',
++      },
++      {
++        envVarName: 'SPRITES_ORGANIZATION',
++        label: 'Sprites Organization',
++        required: false,
++        category: 'credential',
++        advanced: true,
++      },
++      {
++        envVarName: 'SPRITES_SIZE',
++        label: 'Sprite size',
++        required: false,
++        category: 'infrastructure',
++        advanced: true,
++        input: {
++          type: 'select',
++          options: [
++            { value: 'small', label: 'Small' },
++            { value: 'default', label: 'Default' },
++            { value: 'large', label: 'Large' },
++          ],
++          placeholder: 'Provider default',
++        },
++      },
++      {
++        envVarName: 'SPRITES_TIMEOUT_MS',
++        label: 'Idle timeout (milliseconds)',
++        required: false,
++        category: 'infrastructure',
++        advanced: true,
++        input: { type: 'number', min: 1, step: 1 },
++      },
++    ],
++  },
++  {
++    provider: 'lizard',
++    label: 'Lizard',
++    description:
++      'Firecracker microVM sandboxes with per-port preview URLs, pause/resume standby, and full-disk snapshots. Fast to boot and billed per second.',
++    supportsSnapshots: true,
++    fields: [
++      {
++        envVarName: 'LIZARD_API_KEY',
++        label: 'Lizard API Key',
++        secret: true,
++        category: 'credential',
++      },
++      {
++        envVarName: 'LIZARD_PROJECT',
++        label: 'Lizard Project',
++        category: 'credential',
++        helpText:
++          'Every sandbox is billed to a project. Use the project ID, slug, or name.',
++      },
++      {
++        envVarName: 'LIZARD_TEMPLATE',
++        label: 'Sandbox template',
++        required: false,
++        category: 'infrastructure',
++        advanced: true,
++        input: {
++          type: 'select',
++          options: [
++            { value: 'interpreter', label: 'Interpreter (Node 22 + Python)' },
++            { value: 'claude', label: 'Claude' },
++            { value: 'opencode', label: 'OpenCode' },
++            { value: 'base', label: 'Base' },
++          ],
++          placeholder: 'interpreter',
++        },
++        helpText:
++          'Catalog template to boot. The default includes Node 22 and Python.',
++      },
++      {
++        envVarName: 'LIZARD_SIZE',
++        label: 'Sandbox size',
++        required: false,
++        category: 'infrastructure',
++        advanced: true,
++        input: {
++          type: 'select',
++          options: [
++            { value: 'nano', label: 'Nano — 0.5 vCPU / 1 GB' },
++            { value: 'mini', label: 'Mini — 1 vCPU / 2 GB' },
++            { value: 'small', label: 'Small — 2 vCPU / 4 GB' },
++            { value: 'medium', label: 'Medium — 4 vCPU / 8 GB' },
++            { value: 'large', label: 'Large — 8 vCPU / 16 GB' },
++            { value: 'big', label: 'Big — 16 vCPU / 32 GB' },
++          ],
++          placeholder: 'Provider default',
++        },
++        helpText:
++          'Smallest size to use. Per-task memory requirements can raise it.',
++      },
++      {
++        envVarName: 'LIZARD_TIMEOUT_MS',
++        label: 'Active timeout (milliseconds)',
++        required: false,
++        category: 'infrastructure',
++        advanced: true,
++        input: { type: 'number', min: 1 },
++        helpText: 'Defaults to 2 hours.',
++      },
++      {
++        envVarName: 'LIZARD_API_URL',
++        label: 'Lizard API URL',
++        required: false,
++        category: 'infrastructure',
++        advanced: true,
++        helpText: 'Leave blank for the Lizard cloud.',
++      },
++      {
++        envVarName: 'LIZARD_STANDBY_MAX_COUNT',
++        label: 'Maximum retained tasks',
++        required: false,
++        category: 'infrastructure',
++        advanced: true,
++        input: { type: 'number', min: 0, step: 1 },
++        helpText: 'Set to 0 to disable standby retention.',
++      },
++      {
++        envVarName: 'LIZARD_STANDBY_MAX_AGE_HOURS',
++        label: 'Retention period (hours)',
++        required: false,
++        category: 'infrastructure',
++        advanced: true,
++        input: { type: 'number', min: 1 },
++      },
++    ],
++  },
+   {
+     provider: 'azure',
+     label: 'Azure Container Apps',

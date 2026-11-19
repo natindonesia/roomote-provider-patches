@@ -1,7 +1,7 @@
 From f97abff87fa1e183827d183016cdc29e59ddbacb Mon Sep 17 00:00:00 2001
 From: Ticlext-Altihaf <hi@ticlext.top>
 Date: Thu, 19 Nov 2026 03:25:28 +0100
-Subject: [PATCH 2/6] feat(compute-providers): add Fly.io Sprites sandbox
+Subject: [PATCH 2/7] feat(compute-providers): add Fly.io Sprites sandbox
  client
 
 Implements ComputeProviderClient over the Sprites REST API

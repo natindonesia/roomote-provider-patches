@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebase the Sprites provider patch series onto current upstream Roomote.
+# Replay the provider patch series onto current upstream Roomote.
 #
 # Usage:
 #   ./sync.sh            # rebase onto origin/develop
@@ -12,7 +12,7 @@ set -euo pipefail
 
 REPO="${ROOMOTE_REPO:-$HOME/src/Roomote}"
 UPSTREAM="${1:-develop}"
-BRANCH="feat/sprites-provider"
+BRANCH="feat/providers"
 PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/patches"
 
 if [[ ! -d "$REPO/.git" ]]; then
